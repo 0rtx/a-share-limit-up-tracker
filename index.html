@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>A股涨停跟踪</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="topbar">
+      <div class="brand">
+        <div class="logo">涨</div>
+        <div>
+          <h1>A股涨停跟踪</h1>
+          <p class="sub">涨停板 · 炸板 · 跌停 实时行情与情绪总结</p>
+        </div>
+      </div>
+      <div class="date-nav">
+        <button id="prevDay" class="icon-btn" title="上一交易日">‹</button>
+        <input type="date" id="dateInput">
+        <button id="nextDay" class="icon-btn" title="下一交易日">›</button>
+        <button id="todayBtn" class="ghost-btn">今天</button>
+        <button id="refreshBtn" class="ghost-btn">刷新</button>
+      </div>
+    </header>
+
+    <div class="statusbar">
+      <div class="left">
+        <span class="live-dot" id="liveDot"></span>
+        <span id="statusText">初始化…</span>
+        <span class="countdown" id="countdown"></span>
+      </div>
+      <div class="right">
+        <label class="chk" title="当你停留在最新交易日时，新交易日数据出现后自动切换过去"><input type="checkbox" id="followLatest" checked> 自动切换新交易日</label>
+        <button id="pauseBtn" class="ghost-btn small">暂停</button>
+      </div>
+    </div>
+
+    <main>
+      <section class="cards" id="cards"></section>
+
+      <section class="panel summary-panel">
+        <div class="panel-title">今日总结</div>
+        <p id="summaryText" class="summary-text">加载中…</p>
+      </section>
+
+      <section class="panel auction-panel">
+        <div class="panel-head">
+          <div class="panel-title">开盘竞价涨停</div>
+          <span class="panel-note">集合竞价（09:25）即封板 · 实时更新</span>
+        </div>
+        <div class="statline" id="auctionStats"></div>
+        <div class="auction-wrap" id="auctionTable"></div>
+        <div class="zb-note" id="auctionZbNote"></div>
+      </section>
+
+      <section class="panel ladder-panel">
+        <div class="panel-head">
+          <div class="panel-title">连板梯队</div>
+          <span class="panel-note" id="ladderStats"></span>
+        </div>
+        <div class="ladder" id="ladderList"></div>
+      </section>
+
+      <section class="charts">
+        <div class="chart-card">
+          <div class="chart-title">连板高度分布</div>
+          <canvas id="chartLb"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">封板时间分布</div>
+          <canvas id="chartTime"></canvas>
+        </div>
+        <div class="chart-card wide">
+          <div class="chart-title">行业热度 TOP10</div>
+          <canvas id="chartInd"></canvas>
+        </div>
+      </section>
+
+      <section class="panel table-panel">
+        <div class="toolbar">
+          <div class="tabs" id="tabs">
+            <button class="tab active" data-tab="zt">涨停板 <span class="cnt" id="cntZt"></span></button>
+            <button class="tab" data-tab="zb">炸板 <span class="cnt" id="cntZb"></span></button>
+            <button class="tab" data-tab="dt">跌停 <span class="cnt" id="cntDt"></span></button>
+          </div>
+          <div class="filters">
+            <input type="search" id="search" placeholder="搜索代码 / 名称">
+            <select id="lbcFilter">
+              <option value="all">全部连板</option>
+              <option value="1">首板</option>
+              <option value="2">2 板</option>
+              <option value="3">3 板</option>
+              <option value="4">4 板</option>
+              <option value="5">5 板</option>
+              <option value="5p">6 板及以上</option>
+            </select>
+            <select id="industryFilter"><option value="">全部行业</option></select>
+            <button id="exportBtn" class="ghost-btn">导出 CSV</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="stockTable">
+            <thead id="thead"></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+        <div class="table-foot" id="tableFoot"></div>
+      </section>
+    </main>
+
+    <footer>数据来源：东方财富涨停板行情 · 仅供复盘学习参考，不构成投资建议</footer>
+  </div>
+
+  <div id="loading"><div class="spinner"></div></div>
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
