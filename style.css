@@ -183,3 +183,25 @@ footer { padding: 20px 0 30px; color: var(--muted); font-size: 12px; text-align:
 @media (max-width: 900px) { .cards { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 860px) { .charts { grid-template-columns: 1fr; } }
 @media (max-width: 560px) { .cards { grid-template-columns: repeat(2, 1fr); } .filters { margin-left: 0; } }
+
+/* stock chart modal */
+a.name-link { color: var(--text); text-decoration: none; cursor: pointer; }
+a.name-link:hover { color: var(--accent); text-decoration: underline; }
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(5, 8, 15, .68);
+  display: none; align-items: center; justify-content: center; z-index: 60; padding: 20px;
+}
+.modal-mask.show { display: flex; }
+.modal {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+  width: min(760px, 100%); max-height: 92vh; overflow: auto;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .5);
+}
+.modal-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.modal-title { font-size: 15px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; }
+.modal-title .code { color: var(--muted); font-variant-numeric: tabular-nums; }
+.modal-close { background: none; border: none; color: var(--muted); font-size: 26px; line-height: 1; cursor: pointer; padding: 0 6px; }
+.modal-close:hover { color: var(--text); }
+.modal-body { padding: 14px 18px 18px; }
+.mini-chart { margin-bottom: 8px; }
+.mini-title { font-size: 13px; color: var(--muted); margin-bottom: 6px; }

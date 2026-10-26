@@ -116,6 +116,25 @@
   <div id="loading"><div class="spinner"></div></div>
   <div id="toast"></div>
 
+  <div class="modal-mask" id="chartModal">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="modal-title" id="modalTitle"></div>
+        <button class="modal-close" id="modalClose" title="关闭">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="mini-chart">
+          <div class="mini-title">分时走势</div>
+          <canvas id="chartIntra"></canvas>
+        </div>
+        <div class="mini-chart">
+          <div class="mini-title">日K线（前复权）</div>
+          <canvas id="chartKline"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script src="app.js"></script>
 </body>
 </html>

@@ -108,6 +108,11 @@ const auctionTable = $('auctionTable');
 const auctionZbNote = $('auctionZbNote');
 const ladderStats = $('ladderStats');
 const ladderList = $('ladderList');
+const chartModal = $('chartModal');
+const modalTitle = $('modalTitle');
+const modalClose = $('modalClose');
+const chartIntra = $('chartIntra');
+const chartKline = $('chartKline');
 
 /* ---------- utils ---------- */
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
@@ -412,6 +417,202 @@ function renderLadder() {
   ladderList.innerHTML = html;
 }
 
+/* ---------- stock chart modal ---------- */
+let modalStock = null;
+let modalTimer = null;
+
+function secidOf(s) { return s.m + '.' + s.c; }
+
+async function fetchTrend(s) {
+  const url = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=' + secidOf(s) +
+    '&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1';
+  const res = await jsonp(url);
+  const d = res && res.data;
+  if (!d || !Array.isArray(d.trends)) throw new Error('无分时数据');
+  const preClose = parseFloat(d.preClose);
+  const points = d.trends.map(function (it) {
+    const p = String(it).split(',');
+    return { t: p[0].split(' ')[1], price: parseFloat(p[2]) };
+  }).filter(function (p) { return isFinite(p.price); });
+  return { preClose: preClose, points: points };
+}
+
+async function fetchKline(s, date) {
+  const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secidOf(s) +
+    '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&beg=0&end=' + date + '&lmt=90';
+  const res = await jsonp(url);
+  const d = res && res.data;
+  if (!d || !Array.isArray(d.klines)) throw new Error('无K线数据');
+  return d.klines.map(function (it) {
+    const p = String(it).split(',');
+    return { date: p[0], o: parseFloat(p[1]), c: parseFloat(p[2]), h: parseFloat(p[3]), l: parseFloat(p[4]) };
+  }).filter(function (x) { return isFinite(x.c); }).slice(-60);
+}
+
+function drawNote(canvas, text) {
+  const g = setupCanvas(canvas, 250);
+  g.ctx.clearRect(0, 0, g.W, g.H);
+  g.ctx.fillStyle = '#8b949e';
+  g.ctx.font = '12px sans-serif';
+  g.ctx.textAlign = 'center';
+  g.ctx.fillText(text, g.W / 2, g.H / 2);
+}
+
+function drawIntraday(canvas, preClose, points) {
+  const H = 250;
+  const g = setupCanvas(canvas, H);
+  const ctx = g.ctx, W = g.W;
+  ctx.clearRect(0, 0, W, H);
+  if (!points.length) { emptyChart(ctx, W, H); return; }
+  const padL = 48, padR = 12, padT = 12, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let minP = preClose, maxP = preClose;
+  points.forEach(function (p) { if (p.price < minP) minP = p.price; if (p.price > maxP) maxP = p.price; });
+  if (maxP === minP) { maxP += 0.01; minP -= 0.01; }
+  let range = maxP - minP;
+  minP -= range * 0.06; maxP += range * 0.06;
+  range = maxP - minP;
+  function yOf(v) { return padT + plotH * (maxP - v) / range; }
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  for (let i = 0; i <= 4; i++) {
+    const v = maxP - range * i / 4;
+    const y = yOf(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 4, y + 4);
+  }
+
+  const ypc = yOf(preClose);
+  ctx.strokeStyle = '#9aa4b2';
+  ctx.setLineDash([4, 4]);
+  ctx.beginPath(); ctx.moveTo(padL, ypc); ctx.lineTo(W - padR, ypc); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillText('昨收 ' + preClose.toFixed(2), 4, ypc - 3);
+
+  const n = points.length;
+  const last = points[n - 1].price;
+  const color = last >= preClose ? '#ff4d4f' : '#16c784';
+  const xs = points.map(function (p, i) { return padL + plotW * i / Math.max(1, n - 1); });
+  ctx.beginPath();
+  points.forEach(function (p, i) {
+    const x = xs[i], y = yOf(p.price);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(xs[0], yOf(points[0].price));
+  for (let i = 1; i < n; i++) ctx.lineTo(xs[i], yOf(points[i].price));
+  ctx.lineTo(xs[n - 1], ypc);
+  ctx.lineTo(xs[0], ypc);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
+  grad.addColorStop(0, color + '2e');
+  grad.addColorStop(1, color + '00');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.fillStyle = '#8b949e';
+  ctx.textAlign = 'center';
+  [[0, '09:30'], [0.25, '10:30'], [0.5, '11:30/13:00'], [0.75, '14:00'], [1, '15:00']].forEach(function (lb) {
+    ctx.fillText(lb[1], padL + plotW * lb[0], H - 6);
+  });
+}
+
+function drawKlineChart(canvas, kl) {
+  const H = 250;
+  const g = setupCanvas(canvas, H);
+  const ctx = g.ctx, W = g.W;
+  ctx.clearRect(0, 0, W, H);
+  if (!kl.length) { emptyChart(ctx, W, H); return; }
+  const padL = 48, padR = 12, padT = 12, padB = 24;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  let minL = Infinity, maxH = -Infinity;
+  kl.forEach(function (k) { if (k.l < minL) minL = k.l; if (k.h > maxH) maxH = k.h; });
+  if (!isFinite(minL) || !isFinite(maxH)) { emptyChart(ctx, W, H); return; }
+  let range = maxH - minL || 1;
+  minL -= range * 0.06; maxH += range * 0.06;
+  range = maxH - minL;
+  function yOf(v) { return padT + plotH * (maxH - v) / range; }
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '11px sans-serif';
+  ctx.textAlign = 'left';
+  for (let i = 0; i <= 4; i++) {
+    const v = maxH - range * i / 4;
+    const y = yOf(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), 4, y + 4);
+  }
+
+  const n = kl.length;
+  const step = plotW / n;
+  const bw = Math.max(2, Math.min(11, step * 0.7));
+  kl.forEach(function (k, i) {
+    const x = padL + step * (i + 0.5);
+    const up = k.c >= k.o;
+    const color = up ? '#ff4d4f' : '#16c784';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, yOf(k.h)); ctx.lineTo(x, yOf(k.l)); ctx.stroke();
+    const yTop = yOf(Math.max(k.o, k.c));
+    const yBot = yOf(Math.min(k.o, k.c));
+    const bh = Math.max(1, yBot - yTop);
+    ctx.fillStyle = color;
+    roundRect(ctx, x - bw / 2, yTop, bw, bh, 1);
+    ctx.fill();
+  });
+
+  ctx.fillStyle = '#8b949e';
+  ctx.textAlign = 'center';
+  [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i) {
+    ctx.fillText(String(kl[i].date).slice(5), padL + step * (i + 0.5), H - 6);
+  });
+}
+
+async function refreshModalChart() {
+  if (!modalStock) return;
+  drawNote(chartIntra, '加载中…');
+  drawNote(chartKline, '加载中…');
+  const isLatest = (state.date === latestDate);
+  try {
+    const klP = fetchKline(modalStock, state.date);
+    if (isLatest) {
+      const [tr, kl] = await Promise.all([fetchTrend(modalStock), klP]);
+      drawIntraday(chartIntra, tr.preClose, tr.points);
+      drawKlineChart(chartKline, kl);
+    } else {
+      const kl = await klP;
+      drawNote(chartIntra, '历史日期暂无分时数据');
+      drawKlineChart(chartKline, kl);
+    }
+  } catch (e) {
+    drawNote(chartIntra, '加载失败');
+    drawNote(chartKline, '加载失败');
+  }
+}
+
+function openChart(s) {
+  modalStock = s;
+  chartModal.classList.add('show');
+  modalTitle.innerHTML = '<span>' + esc(s.n) + '</span><span class="code">' + s.c + '</span>' + (s.zdp != null ? '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>' : '');
+  requestAnimationFrame(function () { refreshModalChart(); });
+  if (modalTimer) clearInterval(modalTimer);
+  modalTimer = setInterval(function () { refreshModalChart(); }, 30000);
+}
+
+function closeChart() {
+  chartModal.classList.remove('show');
+  modalStock = null;
+  if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
+}
+
 /* ---------- charts ---------- */
 function setupCanvas(canvas, H) {
   const dpr = window.devicePixelRatio || 1;
@@ -555,7 +756,7 @@ function renderHead() {
 function cellHTML(k, s) {
   switch (k) {
     case 'code': return '<span class="code">' + esc(s.c) + '</span>';
-    case 'name': return '<span class="name">' + esc(s.n) + '</span>';
+    case 'name': return '<a class="name name-link" href="javascript:void(0)">' + esc(s.n) + '</a>';
     case 'price': return '<span class="' + pclass(s.zdp) + '">' + fmtPrice(s.p) + '</span>';
     case 'zdp': return '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>';
     case 'lbc': return lbcBadge(s.lbc);
@@ -621,7 +822,7 @@ function renderTable() {
       const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '');
       return '<td data-k="' + c.k + '" class="' + cls.trim() + '">' + cellHTML(c.k, s) + '</td>';
     });
-    return '<tr>' + cells.join('') + '</tr>';
+    return '<tr data-code="' + s.c + '" data-m="' + s.m + '" data-name="' + esc(s.n) + '">' + cells.join('') + '</tr>';
   }).join('');
   tableFootEl.textContent = '共 ' + rows.length + ' 条';
 }
@@ -823,6 +1024,21 @@ ladderList.addEventListener('click', (e) => {
   if (state.tab !== 'zt') setTab('zt');
   else renderTable();
   document.querySelector('.table-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+});
+modalClose.addEventListener('click', closeChart);
+chartModal.addEventListener('click', (e) => { if (e.target === chartModal) closeChart(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeChart(); });
+tbodyEl.addEventListener('click', (e) => {
+  const link = e.target.closest('.name-link');
+  if (!link) return;
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const code = tr.dataset.code;
+  const list = state.data[state.tab] || [];
+  let stock = null;
+  for (let i = 0; i < list.length; i++) { if (String(list[i].c) === code) { stock = list[i]; break; } }
+  if (!stock) stock = { c: code, m: tr.dataset.m, n: tr.dataset.name || code };
+  openChart(stock);
 });
 theadEl.addEventListener('click', (e) => {
   const th = e.target.closest('th.sortable');
