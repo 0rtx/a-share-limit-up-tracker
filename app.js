@@ -461,31 +461,50 @@ function renderLadder() {
 let modalStock = null;
 let modalTimer = null;
 
-function secidOf(s) { return s.m + '.' + s.c; }
+function txCode(s) {
+  const c = String(s.c);
+  if (c[0] === '6') return 'sh' + c;
+  if (c[0] === '4' || c[0] === '8' || c.slice(0, 3) === '920') return 'bj' + c;
+  return 'sz' + c;
+}
+
+async function fetchJson(url, timeout = 10000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('请求失败 ' + res.status);
+    return await res.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function fetchTrend(s) {
-  const url = 'https://push2his.eastmoney.com/api/qt/stock/trends2/get?secid=' + secidOf(s) +
-    '&fields1=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1';
-  const res = await jsonp(url);
-  const d = res && res.data;
-  if (!d || !Array.isArray(d.trends)) throw new Error('无分时数据');
-  const preClose = parseFloat(d.preClose);
-  const points = d.trends.map(function (it) {
-    const p = String(it).split(',');
-    return { t: p[0].split(' ')[1], price: parseFloat(p[2]) };
+  const code = txCode(s);
+  const j = await fetchJson('https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=' + code);
+  const node = j && j.data && j.data[code];
+  const qt = node && node.qt && node.qt[code];
+  const arr = node && node.data && node.data.data;
+  if (!arr || !arr.length) throw new Error('无分时数据');
+  const preClose = parseFloat(qt && qt[4]);
+  const points = arr.map(function (it) {
+    const p = String(it).split(' ');
+    const t = String(p[0] || '');
+    return { t: t.slice(0, 2) + ':' + t.slice(2), price: parseFloat(p[1]) };
   }).filter(function (p) { return isFinite(p.price); });
   return { preClose: preClose, points: points };
 }
 
 async function fetchKline(s, date) {
-  const url = 'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=' + secidOf(s) +
-    '&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&beg=0&end=' + date + '&lmt=90';
-  const res = await jsonp(url);
-  const d = res && res.data;
-  if (!d || !Array.isArray(d.klines)) throw new Error('无K线数据');
-  return d.klines.map(function (it) {
-    const p = String(it).split(',');
-    return { date: p[0], o: parseFloat(p[1]), c: parseFloat(p[2]), h: parseFloat(p[3]), l: parseFloat(p[4]) };
+  const code = txCode(s);
+  const end = toInput(fmtYmd(addDays(parseYmd(date), 1)));
+  const j = await fetchJson('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=' + code + ',day,2000-01-01,' + end + ',90,qfq');
+  const node = j && j.data && j.data[code];
+  const arr = (node && (node.qfqday || node.day)) || [];
+  if (!arr || !arr.length) throw new Error('无K线数据');
+  return arr.map(function (it) {
+    return { date: it[0], o: parseFloat(it[1]), c: parseFloat(it[2]), h: parseFloat(it[3]), l: parseFloat(it[4]) };
   }).filter(function (x) { return isFinite(x.c); }).slice(-60);
 }
 
@@ -622,19 +641,20 @@ async function refreshModalChart() {
   drawNote(chartKline, '加载中…');
   const isLatest = (state.date === latestDate);
   try {
-    const klP = fetchKline(modalStock, state.date);
-    if (isLatest) {
-      const [tr, kl] = await Promise.all([fetchTrend(modalStock), klP]);
-      drawIntraday(chartIntra, tr.preClose, tr.points);
-      drawKlineChart(chartKline, kl);
-    } else {
-      const kl = await klP;
-      drawNote(chartIntra, '历史日期暂无分时数据');
-      drawKlineChart(chartKline, kl);
-    }
+    const kl = await fetchKline(modalStock, state.date);
+    drawKlineChart(chartKline, kl);
   } catch (e) {
-    drawNote(chartIntra, '加载失败');
-    drawNote(chartKline, '加载失败');
+    drawNote(chartKline, 'K线加载失败');
+  }
+  if (isLatest) {
+    try {
+      const tr = await fetchTrend(modalStock);
+      drawIntraday(chartIntra, tr.preClose, tr.points);
+    } catch (e) {
+      drawNote(chartIntra, '分时加载失败');
+    }
+  } else {
+    drawNote(chartIntra, '历史日期暂无分时数据');
   }
 }
 
