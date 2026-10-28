@@ -240,6 +240,7 @@ a.name-link:hover { color: var(--accent); text-decoration: underline; }
 .hot-main { flex: 1; min-width: 0; }
 .hot-name { font-size: 14px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 8px; }
 .hot-lead { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.hot-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .hot-pct { font-size: 18px; font-weight: 700; flex: none; width: 84px; text-align: right; }
 .zt-badge { font-size: 11px; padding: 1px 7px; border-radius: 10px; background: rgba(255, 77, 79, .16); color: #ff8a8c; font-weight: 600; }
 .ratio-bar { height: 4px; background: rgba(22, 199, 132, .18); border-radius: 3px; margin-top: 6px; overflow: hidden; }

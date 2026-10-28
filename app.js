@@ -678,28 +678,59 @@ const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, so
 const boardCache = { '1': [], '2': [], '3': [] };
 const boardFetching = {};
 
-async function fetchBoardsPage(type, pn) {
-  const url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=' + pn + '&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:' + type + '+f:!50&fields=f2,f3,f12,f14,f20,f25,f62,f104,f105,f128,f136';
-  const res = await jsonp(url, 8000);
-  const d = res && res.data;
-  return (d && Array.isArray(d.diff)) ? { total: d.total || 0, diff: d.diff } : null;
+function sinaBoardMeta(type) {
+  if (type === '1') return { url: 'https://money.finance.sina.com.cn/q/view/newFLJK.php?param=area', v: 'S_Finance_bankuai_area' };
+  if (type === '3') return { url: 'https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class', v: 'S_Finance_bankuai_class' };
+  return { url: 'https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php', v: 'S_Finance_bankuai_sinaindustry' };
+}
+
+function mapSinaBoards(raw) {
+  const list = [];
+  Object.keys(raw || {}).forEach(function (k) {
+    const p = String(raw[k] || '').split(',');
+    if (p.length < 13) return;
+    const name = p[1];
+    if (!name) return;
+    list.push({
+      f12: p[0],
+      f14: name,
+      f3: parseFloat(p[5]) || 0,
+      f25: parseFloat(p[7]) || 0,
+      f128: p[12] || p[8] || '—',
+      f136: parseFloat(p[9]) || 0,
+      f104: null,
+      f105: null,
+      f62: null,
+      f20: null,
+      _cnt: parseInt(p[2], 10) || 0
+    });
+  });
+  return list.sort(function (a, b) { return (+b.f3) - (+a.f3); });
+}
+
+function loadSinaBoards(type) {
+  const meta = sinaBoardMeta(type);
+  return new Promise(function (resolve, reject) {
+    const script = document.createElement('script');
+    let settled = false;
+    const timer = setTimeout(function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块请求超时')); } }, 12000);
+    function cleanup() { delete window[meta.v]; if (script.parentNode) script.parentNode.removeChild(script); clearTimeout(timer); }
+    script.onload = function () {
+      if (settled) return;
+      const raw = window[meta.v];
+      settled = true;
+      cleanup();
+      if (!raw) { reject(new Error('板块数据为空')); return; }
+      try { resolve(mapSinaBoards(raw)); } catch (e) { reject(e); }
+    };
+    script.onerror = function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块网络请求失败')); } };
+    script.src = meta.url;
+    document.head.appendChild(script);
+  });
 }
 
 async function fetchBoards(type) {
-  let first = null;
-  try { first = await fetchBoardsPage(type, 1); }
-  catch (e) { try { first = await fetchBoardsPage(type, 1); } catch (e2) { throw e2; } }
-  if (!first || !Array.isArray(first.diff) || !first.diff.length) return [];
-  const total = first.total || first.diff.length;
-  const pages = Math.min(Math.ceil(total / 100), 10);
-  const jobs = [];
-  for (let pn = 2; pn <= pages; pn++) jobs.push(fetchBoardsPage(type, pn));
-  const settled = await Promise.allSettled(jobs);
-  const list = first.diff.slice();
-  settled.forEach(function (r) {
-    if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.diff)) list.push.apply(list, r.value.diff);
-  });
-  return list;
+  return loadSinaBoards(type);
 }
 
 function fetchBoardsCached(type) {
@@ -718,8 +749,12 @@ function ztHybkList() {
 
 function ztCountFor(name, hybkList) {
   let c = 0;
+  const nm = String(name || '');
+  if (!nm) return 0;
   for (let i = 0; i < hybkList.length; i++) {
-    if (name.indexOf(hybkList[i]) === 0) c++;
+    const h = hybkList[i];
+    if (!h) continue;
+    if (nm.indexOf(h) >= 0 || h.indexOf(nm) >= 0) c++;
   }
   return c;
 }
@@ -784,12 +819,12 @@ function renderFeaturedBoards(list) {
     const rankCls = r === 1 ? 'rank-1' : (r === 2 ? 'rank-2' : (r === 3 ? 'rank-3' : ''));
     const pctCls = (+b.f3 || 0) > 0 ? 'up' : ((+b.f3 || 0) < 0 ? 'down' : '');
     const leadCls = (+b.f136 || 0) >= 0 ? 'up' : 'down';
-    const ratio = udRatio(b.f104, b.f105);
+    const cntHtml = b._cnt ? '<div class="hot-sub">' + b._cnt + ' 家公司</div>' : '';
     return '<div class="hot-row"><span class="hot-rank ' + rankCls + '">' + r + '</span>' +
       '<div class="hot-main">' +
         '<div class="hot-name">' + esc(b.f14) + (b._zc ? ' <span class="zt-badge">涨停 ' + b._zc + '</span>' : '') + '</div>' +
         '<div class="hot-lead">领涨 ' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="' + leadCls + '">' + fmtSignedPct(b.f136) + '</span>' : '') + '</div>' +
-        '<div class="ratio-bar"><div class="ratio-up" style="width:' + ratio + '%"></div></div>' +
+        cntHtml +
       '</div>' +
       '<div class="hot-pct ' + pctCls + '">' + fmtSignedPct(b.f3) + '</div></div>';
   }).join('');
@@ -813,23 +848,17 @@ function renderBoardTable(list) {
     '<th class="num sortable" data-bk="strength">强度' + arrow('strength') + '</th>' +
     '<th class="l sortable" data-bk="f14">板块名称' + arrow('f14') + '</th>' +
     '<th class="num sortable" data-bk="f3">涨跌幅' + arrow('f3') + '</th>' +
-    '<th class="num sortable" data-bk="f104">上涨' + arrow('f104') + '</th>' +
-    '<th class="num sortable" data-bk="f105">下跌' + arrow('f105') + '</th>' +
+    '<th class="num sortable" data-bk="_cnt">公司家数' + arrow('_cnt') + '</th>' +
     '<th class="l">领涨股</th>' +
-    '<th class="num sortable" data-bk="f62">主力净流入' + arrow('f62') + '</th>' +
     '<th class="num sortable" data-bk="f25">成交额' + arrow('f25') + '</th>' +
-    '<th class="num sortable" data-bk="f20">总市值' + arrow('f20') + '</th>' +
     '</tr></thead>';
   const body = '<tbody>' + rows.map(function (b) {
     return '<tr><td class="num up">' + b._strength + '</td>' +
       '<td class="l name">' + esc(b.f14) + '<span class="board-code">' + esc(b.f12) + '</span>' + (b._zc ? ' <span class="zt-badge">涨停' + b._zc + '</span>' : '') + '</td>' +
       '<td class="num"><span class="pct-pill ' + pclass(b.f3) + '">' + fmtSignedPct(b.f3) + '</span></td>' +
-      '<td class="num up">' + (b.f104 || 0) + '</td>' +
-      '<td class="num down">' + (b.f105 || 0) + '</td>' +
+      '<td class="num muted">' + (b._cnt || 0) + '</td>' +
       '<td class="l">' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="muted">' + fmtSignedPct(b.f136) + '</span>' : '') + '</td>' +
-      '<td class="num ' + pclass(b.f62) + '">' + fmtSignedMoney(b.f62) + '</td>' +
-      '<td class="num">' + fmtMoney(b.f25) + '</td>' +
-      '<td class="num">' + fmtMoney(b.f20) + '</td></tr>';
+      '<td class="num">' + fmtMoney(b.f25) + '</td></tr>';
   }).join('') + '</tbody>';
   boardBody.innerHTML = '<div class="board-table-wrap"><table>' + head + body + '</table></div>';
 }
