@@ -3,7 +3,7 @@
 const UT = '7eea3edcaed734bea9cbfc24409ed989';
 const DPT = 'wz.ztzt';
 const BASE = 'https://push2ex.eastmoney.com/';
-const EP = { zt: 'getTopicZTPool', zb: 'getTopicZBPool', dt: 'getTopicDTPool' };
+const EP = { zt: 'getTopicZTPool', zb: 'getTopicZBPool', dt: 'getTopicDTPool', qs: 'getTopicQSPool' };
 
 const TIME_BUCKETS = [
   { label: '竞价', from: 0, to: 92959 },
@@ -62,13 +62,30 @@ const COLS = {
     { k: 'hs', label: '换手率', sort: 'hs', num: true },
     { k: 'amount', label: '成交额', sort: 'amount', num: true },
     { k: 'hybk', label: '行业', sort: 'hybk' }
+  ],
+  qs: [
+    { k: 'idx', label: '#' },
+    { k: 'code', label: '代码', sort: 'c' },
+    { k: 'name', label: '名称', sort: 'n' },
+    { k: 'price', label: '最新价', sort: 'p', num: true },
+    { k: 'zdp', label: '涨跌幅', sort: 'zdp', num: true },
+    { k: 'ztp', label: '涨停价', sort: 'ztp', num: true },
+    { k: 'hs', label: '换手率', sort: 'hs', num: true },
+    { k: 'lb', label: '量比', sort: 'lb', num: true },
+    { k: 'zs', label: '涨速', sort: 'zs', num: true },
+    { k: 'nh', label: '新高', sort: 'nh' },
+    { k: 'zttj', label: '涨停统计', sort: 'zttj' },
+    { k: 'cc', label: '入选理由', sort: 'cc' },
+    { k: 'amount', label: '成交额', sort: 'amount', num: true },
+    { k: 'ltsz', label: '流通市值', sort: 'ltsz', num: true },
+    { k: 'hybk', label: '行业', sort: 'hybk' }
   ]
 };
 
 const state = {
   date: '',
   tab: 'zt',
-  data: { zt: [], zb: [], dt: [] },
+  data: { zt: [], zb: [], dt: [], qs: [] },
   filters: { search: '', lbc: 'all', industry: '' },
   sort: { key: 'fbt', dir: 1 },
   prevZt: null,
@@ -118,6 +135,9 @@ const boardType = $('boardType');
 const boardSearch = $('boardSearch');
 const boardBody = $('boardBody');
 const boardSummary = $('boardSummary');
+const strongSearch = $('strongSearch');
+const strongStats = $('strongStats');
+const strongBody = $('strongBody');
 
 /* ---------- utils ---------- */
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
@@ -203,6 +223,19 @@ async function fetchPool(kind, date) {
     if (list.length >= (d.tc || 0)) break;
   }
   return { list: list, qdate: qdate };
+}
+
+async function fetchStrongPool(date) {
+  const list = [];
+  for (let page = 0; page < 20; page++) {
+    const url = BASE + 'getTopicQSPool?ut=' + UT + '&dpt=' + DPT + '&Pageindex=' + page + '&pagesize=500&sort=' + encodeURIComponent('zdp:desc') + '&date=' + date;
+    const res = await jsonp(url);
+    const d = res && res.data;
+    if (!d || !Array.isArray(d.pool) || d.pool.length === 0) break;
+    list.push.apply(list, d.pool);
+    if (list.length >= (d.tc || 0)) break;
+  }
+  return list;
 }
 
 /* ---------- loading / toast ---------- */
@@ -295,6 +328,7 @@ function renderAll(opts) {
   renderIndustryOptions();
   renderTable();
   renderBoards();
+  renderStrongPool();
   if (!opts.skipPrev) refreshPrevDelta();
 }
 
@@ -813,6 +847,143 @@ function renderBoards() {
   });
 }
 
+/* ---------- strong stock pool ---------- */
+const strongState = { search: '', sort: { key: 'zdp', dir: -1 } };
+
+function ccLabel(cc) {
+  if (cc === 3) return '60日新高且近期多次涨停';
+  if (cc === 2) return '近期多次涨停';
+  if (cc === 1) return '60日新高';
+  return '—';
+}
+
+function ccBadge(cc) {
+  const cls = cc === 3 ? 'cc3' : (cc === 2 ? 'cc2' : (cc === 1 ? 'cc1' : ''));
+  return '<span class="cc-badge ' + cls + '">' + ccLabel(cc) + '</span>';
+}
+
+function strongSortVal(s, key) {
+  if (key === 'n') return String(s.n || '');
+  if (key === 'hybk') return String(s.hybk || '');
+  if (key === 'zttj') return s.zttj ? s.zttj.ct * 100 + s.zttj.days : -1;
+  return +(s[key]) || 0;
+}
+
+function getStrongRows() {
+  let rows = state.data.qs.slice();
+  const q = strongState.search.trim().toLowerCase();
+  if (q) rows = rows.filter((s) => String(s.c).includes(q) || String(s.n || '').toLowerCase().includes(q) || String(s.hybk || '').toLowerCase().includes(q));
+  const col = COLS.qs.find((c) => c.k === strongState.sort.key);
+  const key = col && col.sort;
+  if (key) {
+    const dir = strongState.sort.dir;
+    rows.sort((a, b) => {
+      let va = strongSortVal(a, key), vb = strongSortVal(b, key);
+      if (key === 'n' || key === 'hybk') return String(va).localeCompare(String(vb), 'zh') * dir;
+      return (va - vb) * dir;
+    });
+  }
+  return rows;
+}
+
+function strongCell(k, s) {
+  switch (k) {
+    case 'code': return '<span class="code">' + esc(s.c) + '</span>';
+    case 'name': return '<a class="name name-link" href="javascript:void(0)">' + esc(s.n) + '</a>';
+    case 'price': return '<span class="' + pclass(s.zdp) + '">' + fmtPrice(s.p) + '</span>';
+    case 'zdp': return '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>';
+    case 'ztp': return '<span class="muted">' + fmtPrice(s.ztp) + '</span>';
+    case 'hs': return fmtPct(s.hs);
+    case 'lb': return s.lb == null ? '—' : (+s.lb).toFixed(2);
+    case 'zs': return '<span class="' + pclass(s.zs) + '">' + fmtPct(s.zs) + '</span>';
+    case 'nh': return s.nh == 1 ? '<span class="up">是</span>' : '<span class="muted">—</span>';
+    case 'zttj': return '<span class="muted">' + fmtZttj(s.zttj) + '</span>';
+    case 'cc': return ccBadge(s.cc);
+    case 'amount': return fmtMoney(s.amount);
+    case 'ltsz': return fmtMoney(s.ltsz);
+    case 'hybk': return '<span class="muted">' + esc(s.hybk || '—') + '</span>';
+  }
+  return '';
+}
+
+function renderStrongPool() {
+  const list = state.data.qs;
+  const ztCodes = {};
+  state.data.zt.forEach((s) => { ztCodes[s.c] = true; });
+  const ztToday = list.filter((s) => ztCodes[s.c]).length;
+  const nhCount = list.filter((s) => s.nh == 1).length;
+  const multiCount = list.filter((s) => s.cc === 2 || s.cc === 3).length;
+  const lbSum = list.reduce((a, s) => a + (+s.lb || 0), 0);
+  const avgLb = list.length ? lbSum / list.length : 0;
+
+  strongStats.innerHTML =
+    '<span class="stat-chip">池内 <b>' + list.length + '</b> 家</span>' +
+    '<span class="stat-chip">今日已涨停 <b>' + ztToday + '</b> 家</span>' +
+    '<span class="stat-chip">60日新高 <b>' + nhCount + '</b> 家</span>' +
+    '<span class="stat-chip">近期多次涨停 <b>' + multiCount + '</b> 家</span>' +
+    '<span class="stat-chip">平均量比 <b>' + avgLb.toFixed(2) + '</b></span>';
+
+  const rows = getStrongRows();
+  if (!rows.length) {
+    strongBody.innerHTML = '<div class="empty-note">' + (list.length ? '无匹配股票' : '暂无强势股池数据（可能为非交易日或数据尚未生成）') + '</div>';
+    return;
+  }
+
+  const cols = COLS.qs;
+  const arrow = function (k) { return strongState.sort.key === k ? (strongState.sort.dir > 0 ? ' ▲' : ' ▼') : ''; };
+  const head = '<thead><tr>' + cols.map((c) => {
+    if (c.k === 'idx') return '<th class="c">#</th>';
+    const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '') + (c.sort ? ' sortable' : '');
+    return '<th data-k="' + c.k + '" class="' + cls.trim() + '">' + c.label + (c.sort ? arrow(c.k) : '') + '</th>';
+  }).join('') + '</tr></thead>';
+
+  const body = '<tbody>' + rows.map((s, i) => {
+    const cells = cols.map((c) => {
+      if (c.k === 'idx') return '<td class="idx">' + (i + 1) + '</td>';
+      const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '');
+      return '<td class="' + cls.trim() + '">' + strongCell(c.k, s) + '</td>';
+    });
+    return '<tr data-code="' + s.c + '" data-m="' + s.m + '" data-name="' + esc(s.n) + '">' + cells.join('') + '</tr>';
+  }).join('') + '</tbody>';
+
+  strongBody.innerHTML = '<div class="board-table-wrap strong-table-wrap"><table>' + head + body + '</table></div>';
+}
+
+function exportStrongCSV() {
+  const rows = getStrongRows();
+  if (!rows.length) { toast('没有可导出的强势股池数据'); return; }
+  const cols = COLS.qs;
+  const header = cols.map((c) => c.label).join(',');
+  const lines = rows.map((s, i) => cols.map((c) => {
+    let v = '';
+    if (c.k === 'idx') v = i + 1;
+    else if (c.k === 'code') v = s.c;
+    else if (c.k === 'name') v = s.n;
+    else if (c.k === 'price') v = fmtPrice(s.p);
+    else if (c.k === 'zdp') v = fmtPct(s.zdp);
+    else if (c.k === 'ztp') v = fmtPrice(s.ztp);
+    else if (c.k === 'hs') v = fmtPct(s.hs);
+    else if (c.k === 'lb') v = s.lb;
+    else if (c.k === 'zs') v = fmtPct(s.zs);
+    else if (c.k === 'nh') v = s.nh == 1 ? '是' : '否';
+    else if (c.k === 'zttj') v = fmtZttj(s.zttj);
+    else if (c.k === 'cc') v = ccLabel(s.cc);
+    else if (c.k === 'amount') v = s.amount;
+    else if (c.k === 'ltsz') v = s.ltsz;
+    else if (c.k === 'hybk') v = s.hybk;
+    return csvQuote(v);
+  }).join(','));
+  const csv = '\uFEFF' + header + '\n' + lines.join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = '强势股池_' + state.date + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(a.href);
+}
+
 /* ---------- charts ---------- */
 function setupCanvas(canvas, H) {
   const dpr = window.devicePixelRatio || 1;
@@ -1042,11 +1213,14 @@ async function init() {
   clearTimeout(refreshTimer);
   setLoading(true);
   try {
-    const [zt, zb, dt] = await Promise.all([fetchPool('zt', '20991231'), fetchPool('zb', '20991231'), fetchPool('dt', '20991231')]);
+    const [zt, zb, dt, qs] = await Promise.all([
+      fetchPool('zt', '20991231'), fetchPool('zb', '20991231'), fetchPool('dt', '20991231'),
+      fetchStrongPool('20991231').catch(() => [])
+    ]);
     const qd = zt.qdate || todayStr();
     state.date = qd;
     dateInput.value = toInput(qd);
-    state.data = { zt: zt.list, zb: zb.list, dt: dt.list };
+    state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs };
     state.tab = 'zt';
     state.filters = { search: '', lbc: 'all', industry: '' };
     searchEl.value = ''; lbcEl.value = 'all';
@@ -1069,7 +1243,10 @@ async function init() {
 
 async function applyDay(date, opts) {
   opts = opts || {};
-  const [zt, zb, dt] = await Promise.all([fetchPool('zt', date), fetchPool('zb', date), fetchPool('dt', date)]);
+  const [zt, zb, dt, qs] = await Promise.all([
+    fetchPool('zt', date), fetchPool('zb', date), fetchPool('dt', date),
+    fetchStrongPool(date).catch(() => [])
+  ]);
   const qd = zt.qdate || date;
   const has = zt.list.length + zb.list.length + dt.list.length > 0;
   let actual = date;
@@ -1079,7 +1256,7 @@ async function applyDay(date, opts) {
   }
   state.date = actual;
   dateInput.value = toInput(actual);
-  state.data = { zt: zt.list, zb: zb.list, dt: dt.list };
+  state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs };
   renderAll({ skipPrev: !!opts.skipPrev });
   return actual;
 }
@@ -1268,6 +1445,27 @@ boardBody.addEventListener('click', (e) => {
   else boardState.sort = { key: k, dir: -1 };
   renderBoardTable(boardState.list);
 });
+strongSearch.addEventListener('input', () => { strongState.search = strongSearch.value; renderStrongPool(); });
+strongBody.addEventListener('click', (e) => {
+  const th = e.target.closest('th.sortable');
+  if (th) {
+    const k = th.dataset.k;
+    if (strongState.sort.key === k) strongState.sort.dir *= -1;
+    else strongState.sort = { key: k, dir: (k === 'n' || k === 'hybk') ? 1 : -1 };
+    renderStrongPool();
+    return;
+  }
+  const link = e.target.closest('.name-link');
+  if (!link) return;
+  const tr = e.target.closest('tr');
+  if (!tr) return;
+  const code = tr.dataset.code;
+  let stock = null;
+  for (let i = 0; i < state.data.qs.length; i++) { if (String(state.data.qs[i].c) === code) { stock = state.data.qs[i]; break; } }
+  if (!stock) stock = { c: code, m: tr.dataset.m, n: tr.dataset.name || code };
+  openChart(stock);
+});
+$('strongExportBtn').addEventListener('click', exportStrongCSV);
 theadEl.addEventListener('click', (e) => {
   const th = e.target.closest('th.sortable');
   if (!th) return;

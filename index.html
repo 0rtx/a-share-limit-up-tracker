@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>A股涨停跟踪</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="alternate icon" href="favicon-32.png" type="image/png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -95,6 +98,19 @@
       <div class="board-note">强度 = 涨停家数×100 + 涨跌幅×10 + 领涨股涨幅（行业板块含当日涨停家数，概念/地域不计涨停）</div>
       <div class="board-summary" id="boardSummary"></div>
         <div id="boardBody"></div>
+      </section>
+
+      <section class="panel strong-panel">
+        <div class="panel-head">
+          <div class="panel-title">强势股池</div>
+          <span class="panel-note">东财强势股池 · 60日新高或近期多次涨停 · 实时更新</span>
+          <div class="strong-tools">
+            <input type="search" id="strongSearch" placeholder="搜索代码 / 名称 / 行业">
+            <button id="strongExportBtn" class="ghost-btn small">导出 CSV</button>
+          </div>
+        </div>
+        <div class="statline" id="strongStats"></div>
+        <div id="strongBody"></div>
       </section>
 
       <section class="panel table-panel">

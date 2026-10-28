@@ -248,3 +248,14 @@ a.name-link:hover { color: var(--accent); text-decoration: underline; }
 .pct-pill.up { background: rgba(255, 77, 79, .16); color: #ff8a8c; }
 .pct-pill.down { background: rgba(22, 199, 132, .16); color: #3ddc97; }
 .board-code { color: var(--muted); font-size: 11px; margin-left: 6px; font-variant-numeric: tabular-nums; }
+
+/* strong stock pool */
+.strong-panel { margin: 12px 0; }
+.strong-tools { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+#strongSearch { width: 200px; }
+.strong-table-wrap { margin-top: 10px; }
+.cc-badge { display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 12px; white-space: nowrap; }
+.cc-badge.cc3 { background: rgba(255, 77, 79, .18); color: #ff8a8c; }
+.cc-badge.cc2 { background: rgba(245, 158, 11, .18); color: #fbbf24; }
+.cc-badge.cc1 { background: rgba(59, 130, 246, .16); color: #7eb2ff; }
+@media (max-width: 560px) { .strong-tools { margin-left: 0; width: 100%; } #strongSearch { flex: 1; width: auto; } }
