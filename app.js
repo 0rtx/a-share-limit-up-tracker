@@ -621,18 +621,41 @@ function closeChart() {
 
 /* ---------- board sector panel ---------- */
 const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, sort: { key: 'strength', dir: -1 } };
+const boardCache = { '1': [], '2': [], '3': [] };
+const boardFetching = {};
+
+async function fetchBoardsPage(type, pn) {
+  const url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=' + pn + '&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:' + type + '+f:!50&fields=f2,f3,f12,f14,f20,f25,f62,f104,f105,f128,f136';
+  const res = await jsonp(url, 8000);
+  const d = res && res.data;
+  return (d && Array.isArray(d.diff)) ? { total: d.total || 0, diff: d.diff } : null;
+}
 
 async function fetchBoards(type) {
-  const list = [];
-  for (let pn = 1; pn <= 10; pn++) {
-    const url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=' + pn + '&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:' + type + '+f:!50&fields=f2,f3,f12,f14,f20,f25,f62,f104,f105,f128,f136';
-    const res = await jsonp(url);
-    const d = res && res.data;
-    if (!d || !Array.isArray(d.diff) || d.diff.length === 0) break;
-    list.push.apply(list, d.diff);
-    if (list.length >= (d.total || 0)) break;
-  }
+  let first = null;
+  try { first = await fetchBoardsPage(type, 1); }
+  catch (e) { try { first = await fetchBoardsPage(type, 1); } catch (e2) { throw e2; } }
+  if (!first || !Array.isArray(first.diff) || !first.diff.length) return [];
+  const total = first.total || first.diff.length;
+  const pages = Math.min(Math.ceil(total / 100), 10);
+  const jobs = [];
+  for (let pn = 2; pn <= pages; pn++) jobs.push(fetchBoardsPage(type, pn));
+  const settled = await Promise.allSettled(jobs);
+  const list = first.diff.slice();
+  settled.forEach(function (r) {
+    if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.diff)) list.push.apply(list, r.value.diff);
+  });
   return list;
+}
+
+function fetchBoardsCached(type) {
+  if (!boardFetching[type]) {
+    boardFetching[type] = fetchBoards(type).then(function (list) {
+      boardCache[type] = list;
+      return list;
+    }).finally(function () { delete boardFetching[type]; });
+  }
+  return boardFetching[type];
 }
 
 function ztHybkList() {
@@ -761,16 +784,32 @@ function renderBoards() {
   const mode = boardState.mode;
   const type = boardState.type;
   const key = mode === 'featured' ? 'featured' : 'all-' + type;
+  const targetType = mode === 'featured' ? '2' : type;
+  const cached = boardCache[targetType];
   if (boardState.currentKey !== key) {
     boardState.currentKey = key;
-    boardBody.innerHTML = '<div class="empty-note">加载中…</div>';
+    if (cached && cached.length) {
+      if (mode === 'featured') renderFeaturedBoards(cached);
+      else renderBoardTable(cached);
+    } else {
+      boardBody.innerHTML = '<div class="empty-note">加载中…</div>';
+    }
   }
-  fetchBoards(mode === 'featured' ? '2' : type).then(function (list) {
+  fetchBoardsCached(targetType).then(function (list) {
     if (boardState.currentKey !== key) return;
-    if (mode === 'featured') renderFeaturedBoards(list);
-    else renderBoardTable(list);
+    if (list && list.length) {
+      if (mode === 'featured') renderFeaturedBoards(list);
+      else renderBoardTable(list);
+    } else if (!(boardCache[targetType] && boardCache[targetType].length)) {
+      boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>';
+    }
   }).catch(function () {
-    if (boardState.currentKey === key) boardBody.innerHTML = '<div class="empty-note">加载失败，请稍后重试</div>';
+    if (boardState.currentKey !== key) return;
+    if (boardCache[targetType] && boardCache[targetType].length) {
+      toast('板块数据更新失败，显示最近一次数据');
+    } else {
+      boardBody.innerHTML = '<div class="empty-note">加载失败，请稍后重试</div>';
+    }
   });
 }
 
