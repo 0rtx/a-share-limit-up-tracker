@@ -619,7 +619,7 @@ function closeChart() {
 }
 
 /* ---------- board sector panel ---------- */
-const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, sort: { key: 'f3', dir: -1 } };
+const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, sort: { key: 'strength', dir: -1 } };
 
 async function fetchBoards(type) {
   const list = [];
@@ -634,47 +634,77 @@ async function fetchBoards(type) {
   return list;
 }
 
+function ztHybkList() {
+  return state.data.zt.map(function (s) { return s.hybk || ''; }).filter(Boolean);
+}
+
+function ztCountFor(name, hybkList) {
+  let c = 0;
+  for (let i = 0; i < hybkList.length; i++) {
+    if (name.indexOf(hybkList[i]) === 0) c++;
+  }
+  return c;
+}
+
+function computeStrength(b, zc) {
+  const pct = +b.f3 || 0;
+  const lead = +b.f136 || 0;
+  return Math.round((zc * 100 + pct * 10 + lead) * 10) / 10;
+}
+
+function decorateBoards(list, type) {
+  const hybkList = ztHybkList();
+  return list.map(function (b) {
+    const zc = type === '2' ? ztCountFor(b.f14 || '', hybkList) : null;
+    b._zc = zc;
+    b._strength = computeStrength(b, zc || 0);
+    return b;
+  });
+}
+
 function renderFeaturedBoards(list) {
-  const top = list.slice(0, 15);
-  if (!top.length) { boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>'; return; }
-  boardBody.innerHTML = '<div class="board-grid">' + top.map(function (b, i) {
+  const rows = decorateBoards(list, '2').sort(function (a, b) { return b._strength - a._strength; }).slice(0, 15);
+  if (!rows.length) { boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>'; return; }
+  boardBody.innerHTML = '<div class="board-grid">' + rows.map(function (b, i) {
     const pctCls = (+b.f3 || 0) > 0 ? 'up' : ((+b.f3 || 0) < 0 ? 'down' : '');
     const leadCls = (+b.f136 || 0) >= 0 ? 'up' : 'down';
     return '<div class="board-card"><span class="b-rank">' + (i + 1) + '</span>' +
       '<div class="b-main"><div class="b-name">' + esc(b.f14) + '</div>' +
       '<div class="b-lead">领涨 ' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="' + leadCls + '">' + fmtPct(b.f136) + '</span>' : '') + '</div></div>' +
-      '<div class="b-right"><div class="b-pct ' + pctCls + '">' + fmtPct(b.f3) + '</div>' +
-      '<div class="b-net muted">' + fmtMoney(b.f62) + '</div></div></div>';
+      '<div class="b-right"><div class="b-strength">强度 <b>' + b._strength + '</b></div>' +
+      '<div class="b-sub"><span class="' + pctCls + '">' + fmtPct(b.f3) + '</span> · 涨停 ' + (b._zc || 0) + ' 家</div></div></div>';
   }).join('') + '</div>';
 }
 
 function renderBoardTable(list) {
-  boardState.list = list;
+  boardState.list = decorateBoards(list, boardState.type);
   const q = boardSearch.value.trim().toLowerCase();
-  let rows = list.slice();
+  let rows = boardState.list.slice();
   if (q) rows = rows.filter(function (b) { return String(b.f14 || '').toLowerCase().indexOf(q) >= 0; });
   const key = boardState.sort.key, dir = boardState.sort.dir;
   rows.sort(function (a, b) {
+    if (key === 'strength') return (a._strength - b._strength) * dir;
+    if (key === 'zc') return ((a._zc || 0) - (b._zc || 0)) * dir;
     if (key === 'f14') return String(a.f14 || '').localeCompare(String(b.f14 || ''), 'zh') * dir;
     return ((+a[key] || 0) - (+b[key] || 0)) * dir;
   });
   if (!rows.length) { boardBody.innerHTML = '<div class="empty-note">无匹配板块</div>'; return; }
   const arrow = function (k) { return boardState.sort.key === k ? (boardState.sort.dir > 0 ? ' ▲' : ' ▼') : ''; };
   const head = '<thead><tr>' +
+    '<th class="num sortable" data-bk="strength">强度' + arrow('strength') + '</th>' +
     '<th class="l sortable" data-bk="f14">板块名称' + arrow('f14') + '</th>' +
     '<th class="num sortable" data-bk="f3">涨跌幅' + arrow('f3') + '</th>' +
     '<th class="l">领涨股</th>' +
-    '<th class="num sortable" data-bk="f104">上涨' + arrow('f104') + '</th>' +
-    '<th class="num sortable" data-bk="f105">下跌' + arrow('f105') + '</th>' +
+    '<th class="num sortable" data-bk="zc">涨停' + arrow('zc') + '</th>' +
     '<th class="num sortable" data-bk="f62">主力净流入' + arrow('f62') + '</th>' +
     '<th class="num sortable" data-bk="f25">成交额' + arrow('f25') + '</th>' +
     '</tr></thead>';
   const body = '<tbody>' + rows.map(function (b) {
-    return '<tr><td class="l name">' + esc(b.f14) + '</td>' +
+    return '<tr><td class="num up">' + b._strength + '</td>' +
+      '<td class="l name">' + esc(b.f14) + '</td>' +
       '<td class="num ' + pclass(b.f3) + '">' + fmtPct(b.f3) + '</td>' +
       '<td class="l">' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="muted">' + fmtPct(b.f136) + '</span>' : '') + '</td>' +
-      '<td class="num up">' + (b.f104 || 0) + '</td>' +
-      '<td class="num down">' + (b.f105 || 0) + '</td>' +
+      '<td class="num up">' + (b._zc == null ? '—' : (b._zc || 0)) + '</td>' +
       '<td class="num ' + pclass(b.f62) + '">' + fmtMoney(b.f62) + '</td>' +
       '<td class="num">' + fmtMoney(b.f25) + '</td></tr>';
   }).join('') + '</tbody>';
