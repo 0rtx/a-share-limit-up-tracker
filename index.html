@@ -78,6 +78,23 @@
         </div>
       </section>
 
+      <section class="panel board-panel">
+        <div class="panel-head">
+          <div class="panel-title">行情板块</div>
+          <div class="board-tabs" id="boardTabs">
+            <button class="board-tab active" data-mode="featured">精选板块</button>
+            <button class="board-tab" data-mode="all">全部板块</button>
+          </div>
+          <div class="board-type" id="boardType" style="display:none">
+            <button class="board-type-btn active" data-type="2">行业</button>
+            <button class="board-type-btn" data-type="3">概念</button>
+            <button class="board-type-btn" data-type="1">地域</button>
+          </div>
+          <input type="search" id="boardSearch" placeholder="搜索板块名称" style="display:none">
+        </div>
+        <div id="boardBody"></div>
+      </section>
+
       <section class="panel table-panel">
         <div class="toolbar">
           <div class="tabs" id="tabs">

@@ -113,6 +113,10 @@ const modalTitle = $('modalTitle');
 const modalClose = $('modalClose');
 const chartIntra = $('chartIntra');
 const chartKline = $('chartKline');
+const boardTabs = $('boardTabs');
+const boardType = $('boardType');
+const boardSearch = $('boardSearch');
+const boardBody = $('boardBody');
 
 /* ---------- utils ---------- */
 function pad(n) { return n < 10 ? '0' + n : '' + n; }
@@ -289,6 +293,7 @@ function renderAll(opts) {
   renderCharts();
   renderIndustryOptions();
   renderTable();
+  renderBoards();
   if (!opts.skipPrev) refreshPrevDelta();
 }
 
@@ -611,6 +616,86 @@ function closeChart() {
   chartModal.classList.remove('show');
   modalStock = null;
   if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
+}
+
+/* ---------- board sector panel ---------- */
+const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, sort: { key: 'f3', dir: -1 } };
+
+async function fetchBoards(type) {
+  const list = [];
+  for (let pn = 1; pn <= 10; pn++) {
+    const url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=' + pn + '&pz=100&po=1&np=1&fltt=2&invt=2&fid=f3&fs=m:90+t:' + type + '+f:!50&fields=f2,f3,f12,f14,f20,f25,f62,f104,f105,f128,f136';
+    const res = await jsonp(url);
+    const d = res && res.data;
+    if (!d || !Array.isArray(d.diff) || d.diff.length === 0) break;
+    list.push.apply(list, d.diff);
+    if (list.length >= (d.total || 0)) break;
+  }
+  return list;
+}
+
+function renderFeaturedBoards(list) {
+  const top = list.slice(0, 15);
+  if (!top.length) { boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>'; return; }
+  boardBody.innerHTML = '<div class="board-grid">' + top.map(function (b, i) {
+    const pctCls = (+b.f3 || 0) > 0 ? 'up' : ((+b.f3 || 0) < 0 ? 'down' : '');
+    const leadCls = (+b.f136 || 0) >= 0 ? 'up' : 'down';
+    return '<div class="board-card"><span class="b-rank">' + (i + 1) + '</span>' +
+      '<div class="b-main"><div class="b-name">' + esc(b.f14) + '</div>' +
+      '<div class="b-lead">领涨 ' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="' + leadCls + '">' + fmtPct(b.f136) + '</span>' : '') + '</div></div>' +
+      '<div class="b-right"><div class="b-pct ' + pctCls + '">' + fmtPct(b.f3) + '</div>' +
+      '<div class="b-net muted">' + fmtMoney(b.f62) + '</div></div></div>';
+  }).join('') + '</div>';
+}
+
+function renderBoardTable(list) {
+  boardState.list = list;
+  const q = boardSearch.value.trim().toLowerCase();
+  let rows = list.slice();
+  if (q) rows = rows.filter(function (b) { return String(b.f14 || '').toLowerCase().indexOf(q) >= 0; });
+  const key = boardState.sort.key, dir = boardState.sort.dir;
+  rows.sort(function (a, b) {
+    if (key === 'f14') return String(a.f14 || '').localeCompare(String(b.f14 || ''), 'zh') * dir;
+    return ((+a[key] || 0) - (+b[key] || 0)) * dir;
+  });
+  if (!rows.length) { boardBody.innerHTML = '<div class="empty-note">无匹配板块</div>'; return; }
+  const arrow = function (k) { return boardState.sort.key === k ? (boardState.sort.dir > 0 ? ' ▲' : ' ▼') : ''; };
+  const head = '<thead><tr>' +
+    '<th class="l sortable" data-bk="f14">板块名称' + arrow('f14') + '</th>' +
+    '<th class="num sortable" data-bk="f3">涨跌幅' + arrow('f3') + '</th>' +
+    '<th class="l">领涨股</th>' +
+    '<th class="num sortable" data-bk="f104">上涨' + arrow('f104') + '</th>' +
+    '<th class="num sortable" data-bk="f105">下跌' + arrow('f105') + '</th>' +
+    '<th class="num sortable" data-bk="f62">主力净流入' + arrow('f62') + '</th>' +
+    '<th class="num sortable" data-bk="f25">成交额' + arrow('f25') + '</th>' +
+    '</tr></thead>';
+  const body = '<tbody>' + rows.map(function (b) {
+    return '<tr><td class="l name">' + esc(b.f14) + '</td>' +
+      '<td class="num ' + pclass(b.f3) + '">' + fmtPct(b.f3) + '</td>' +
+      '<td class="l">' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="muted">' + fmtPct(b.f136) + '</span>' : '') + '</td>' +
+      '<td class="num up">' + (b.f104 || 0) + '</td>' +
+      '<td class="num down">' + (b.f105 || 0) + '</td>' +
+      '<td class="num ' + pclass(b.f62) + '">' + fmtMoney(b.f62) + '</td>' +
+      '<td class="num">' + fmtMoney(b.f25) + '</td></tr>';
+  }).join('') + '</tbody>';
+  boardBody.innerHTML = '<div class="board-table-wrap"><table>' + head + body + '</table></div>';
+}
+
+function renderBoards() {
+  const mode = boardState.mode;
+  const type = boardState.type;
+  const key = mode === 'featured' ? 'featured' : 'all-' + type;
+  if (boardState.currentKey !== key) {
+    boardState.currentKey = key;
+    boardBody.innerHTML = '<div class="empty-note">加载中…</div>';
+  }
+  fetchBoards(mode === 'featured' ? '2' : type).then(function (list) {
+    if (boardState.currentKey !== key) return;
+    if (mode === 'featured') renderFeaturedBoards(list);
+    else renderBoardTable(list);
+  }).catch(function () {
+    if (boardState.currentKey === key) boardBody.innerHTML = '<div class="empty-note">加载失败，请稍后重试</div>';
+  });
 }
 
 /* ---------- charts ---------- */
@@ -1039,6 +1124,34 @@ tbodyEl.addEventListener('click', (e) => {
   for (let i = 0; i < list.length; i++) { if (String(list[i].c) === code) { stock = list[i]; break; } }
   if (!stock) stock = { c: code, m: tr.dataset.m, n: tr.dataset.name || code };
   openChart(stock);
+});
+boardTabs.addEventListener('click', (e) => {
+  const btn = e.target.closest('.board-tab');
+  if (!btn) return;
+  boardState.mode = btn.dataset.mode;
+  document.querySelectorAll('.board-tab').forEach((b) => b.classList.toggle('active', b === btn));
+  const isAll = boardState.mode === 'all';
+  boardType.style.display = isAll ? '' : 'none';
+  boardSearch.style.display = isAll ? '' : 'none';
+  boardState.currentKey = null;
+  renderBoards();
+});
+boardType.addEventListener('click', (e) => {
+  const btn = e.target.closest('.board-type-btn');
+  if (!btn) return;
+  boardState.type = btn.dataset.type;
+  document.querySelectorAll('.board-type-btn').forEach((b) => b.classList.toggle('active', b === btn));
+  boardState.currentKey = null;
+  renderBoards();
+});
+boardSearch.addEventListener('input', () => { renderBoardTable(boardState.list); });
+boardBody.addEventListener('click', (e) => {
+  const th = e.target.closest('th.sortable');
+  if (!th) return;
+  const k = th.dataset.bk;
+  if (boardState.sort.key === k) boardState.sort.dir *= -1;
+  else boardState.sort = { key: k, dir: -1 };
+  renderBoardTable(boardState.list);
 });
 theadEl.addEventListener('click', (e) => {
   const th = e.target.closest('th.sortable');

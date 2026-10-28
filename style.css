@@ -205,3 +205,24 @@ a.name-link:hover { color: var(--accent); text-decoration: underline; }
 .modal-body { padding: 14px 18px 18px; }
 .mini-chart { margin-bottom: 8px; }
 .mini-title { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+
+/* board sector panel */
+.board-panel { margin: 12px 0; }
+.board-tabs { display: flex; gap: 6px; }
+.board-tab { background: #161d2e; border: 1px solid var(--border); color: var(--muted); padding: 6px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; }
+.board-tab.active { background: rgba(59, 130, 246, .15); border-color: rgba(59, 130, 246, .5); color: #7eb2ff; }
+.board-type { display: flex; gap: 6px; }
+.board-type-btn { background: var(--panel2); border: 1px solid var(--border); color: var(--muted); padding: 5px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+.board-type-btn.active { border-color: var(--accent); color: var(--text); }
+#boardSearch { width: 170px; }
+.board-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }
+.board-card { display: flex; align-items: center; gap: 10px; background: var(--panel2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; }
+.b-rank { width: 22px; height: 22px; flex: none; border-radius: 6px; background: rgba(255, 77, 79, .15); color: #ff8a8c; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+.b-main { flex: 1; min-width: 0; }
+.b-name { font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.b-lead { font-size: 12px; color: var(--muted); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.b-right { text-align: right; flex: none; }
+.b-pct { font-size: 15px; font-weight: 700; }
+.b-net { font-size: 11px; margin-top: 2px; }
+.board-table-wrap { max-height: 560px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; margin-top: 10px; }
+.empty-note { padding: 20px; color: var(--muted); font-size: 13px; text-align: center; }
