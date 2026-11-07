@@ -5,43 +5,6 @@ const DPT = 'wz.ztzt';
 const BASE = 'https://push2ex.eastmoney.com/';
 const EP = { zt: 'getTopicZTPool', zb: 'getTopicZBPool', dt: 'getTopicDTPool', qs: 'getTopicQSPool' };
 
-/* ---------- 本地通达信桥接（数据源切换） ---------- */
-const BRIDGE = 'http://127.0.0.1:8770';
-let dataSource = 'cloud';
-try { dataSource = localStorage.getItem('dataSource') || 'cloud'; } catch (e) { /* ignore */ }
-let bridgeOK = false;
-
-async function tdxGet(path, timeout = 90000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    const res = await fetch(BRIDGE + path, { signal: ctrl.signal, cache: 'no-store' });
-    if (!res.ok) throw new Error('本地桥接返回 ' + res.status);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// 按数据源同步界面（数据源下拉、地域板块按钮、板块说明文案）
-function syncSourceUI() {
-  if (sourceSelEl) sourceSelEl.value = dataSource;
-  const regionBtn = document.querySelector('.board-type-btn[data-type="1"]');
-  if (regionBtn) {
-    const show = dataSource !== 'tdx';
-    regionBtn.style.display = show ? '' : 'none';
-    if (!show && boardState.type === '1') {
-      const b2 = document.querySelector('.board-type-btn[data-type="2"]');
-      if (b2) b2.click();
-    }
-  }
-  if (boardNoteEl) {
-    boardNoteEl.textContent = dataSource === 'tdx'
-      ? '行情板块数据来自本地通达信（行业/概念成分 + 通达信日线聚合）· 强度 = 涨停家数×100 + 涨跌幅×10 + 领涨股涨幅 · 地域板块暂不支持'
-      : '行情板块数据来自新浪财经 · 强度 = 涨停家数×100 + 涨跌幅×10 + 领涨股涨幅';
-  }
-}
-
 const TIME_BUCKETS = [
   { label: '竞价', from: 0, to: 92959 },
   { label: '09:30-10:00', from: 93000, to: 100000 },
@@ -158,8 +121,6 @@ const countdownEl = $('countdown');
 const liveDot = $('liveDot');
 const pauseBtn = $('pauseBtn');
 const followLatestEl = $('followLatest');
-const sourceSelEl = $('sourceSel');
-const boardNoteEl = $('boardNote');
 const auctionStats = $('auctionStats');
 const auctionTable = $('auctionTable');
 const auctionZbNote = $('auctionZbNote');
@@ -250,10 +211,6 @@ function jsonp(url, timeout = 15000) {
 }
 
 async function fetchPool(kind, date) {
-  if (dataSource === 'tdx') {
-    const d = await tdxGet('/api/pools?date=' + date);
-    return { list: (d && Array.isArray(d[kind])) ? d[kind] : [], qdate: d && d.qdate ? String(d.qdate) : null };
-  }
   const sort = kind === 'dt' ? 'fund:asc' : 'fbt:asc';
   const list = [];
   let qdate = null;
@@ -270,10 +227,6 @@ async function fetchPool(kind, date) {
 }
 
 async function fetchStrongPool(date) {
-  if (dataSource === 'tdx') {
-    const d = await tdxGet('/api/strong?date=' + date);
-    return Array.isArray(d) ? d : [];
-  }
   const list = [];
   for (let page = 0; page < 20; page++) {
     const url = BASE + 'getTopicQSPool?ut=' + UT + '&dpt=' + DPT + '&Pageindex=' + page + '&pagesize=500&sort=' + encodeURIComponent('zdp:desc') + '&date=' + date;
@@ -332,7 +285,7 @@ function updateStatus() {
   }
   liveDot.className = 'live-dot on';
   const last = state.lastUpdate ? state.lastUpdate.toTimeString().slice(0, 8) : '—';
-  statusText.textContent = '实时更新中 · 最后更新 ' + last + (dataSource === 'tdx' ? ' · 通达信本地' : '');
+  statusText.textContent = '实时更新中 · 最后更新 ' + last;
   const remain = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
   countdownEl.textContent = '下次刷新 ' + remain + 's';
 }
@@ -819,10 +772,6 @@ function loadSinaBoards(type) {
 }
 
 async function fetchBoards(type) {
-  if (dataSource === 'tdx') {
-    const d = await tdxGet('/api/boards?type=' + type);
-    return Array.isArray(d) ? d : [];
-  }
   return loadSinaBoards(type);
 }
 
@@ -861,7 +810,7 @@ function computeStrength(b, zc) {
 function decorateBoards(list, type) {
   const hybkList = ztHybkList();
   return list.map(function (b) {
-    const zc = (b._zc != null) ? b._zc : (type === '2' ? ztCountFor(b.f14 || '', hybkList) : null);
+    const zc = type === '2' ? ztCountFor(b.f14 || '', hybkList) : null;
     b._zc = zc;
     b._strength = computeStrength(b, zc || 0);
     return b;
@@ -1362,20 +1311,6 @@ async function init() {
   pendingScroll = null;
   setLoading(true);
   try {
-    if (dataSource === 'tdx') {
-      try {
-        const ping = await tdxGet('/api/ping', 8000);
-        if (!ping || !ping.ok) throw new Error('bridge down');
-        bridgeOK = true;
-      } catch (e) {
-        dataSource = 'cloud';
-        bridgeOK = false;
-        try { localStorage.setItem('dataSource', 'cloud'); } catch (e2) { /* ignore */ }
-        if (sourceSelEl) sourceSelEl.value = 'cloud';
-        toast('本地通达信服务未启动（请运行 bridge\\run_bridge.bat），已自动切换回云端数据源');
-      }
-    }
-    syncSourceUI();
     const [zt, zb, dt, qs] = await Promise.all([
       fetchPool('zt', '20991231'), fetchPool('zb', '20991231'), fetchPool('dt', '20991231'),
       fetchStrongPool('20991231').catch(() => null)
@@ -1423,8 +1358,7 @@ async function applyDay(date, opts) {
   if (qs == null && !opts.silent) toast('强势股池数据更新失败，已保留上次数据');
   state.qsError = qs == null;
   state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs == null ? (state.data.qs || []) : qs };
-  // 通达信模式不逐日回溯“较上一交易日”对比（历史池计算较慢），跳过
-  renderAll({ skipPrev: !!opts.skipPrev || dataSource === 'tdx' });
+  renderAll({ skipPrev: !!opts.skipPrev });
   return actual;
 }
 
@@ -1446,17 +1380,6 @@ async function nav(dir) {
   pendingScroll = null;
   setLoading(true);
   try {
-    if (dataSource === 'tdx') {
-      const base = state.date || todayStr();
-      const cal = await tdxGet('/api/calendar?date=' + base + '&dir=' + dir, 15000);
-      if (cal && cal.latest) latestDate = cal.latest;
-      if (cal && cal.date) {
-        await loadDate(cal.date);
-      } else {
-        toast(dir < 0 ? '未找到更早的交易日数据' : '已是最新交易日');
-      }
-      return;
-    }
     const base = state.date || todayStr();
     if (!latestDate) latestDate = state.date;
     let d = parseYmd(base);
@@ -1625,39 +1548,6 @@ pauseBtn.addEventListener('click', () => {
   updateStatus();
 });
 followLatestEl.addEventListener('change', () => { state.followLatest = followLatestEl.checked; });
-if (sourceSelEl) sourceSelEl.addEventListener('change', async () => {
-  const v = sourceSelEl.value;
-  if (v === dataSource) return;
-  if (v === 'tdx') {
-    try {
-      const ping = await tdxGet('/api/ping', 8000);
-      if (!ping || !ping.ok) throw new Error('bridge down');
-      bridgeOK = true;
-      dataSource = 'tdx';
-    } catch (e) {
-      toast('本地通达信服务未启动：请先运行 bridge\\run_bridge.bat');
-      sourceSelEl.value = dataSource;
-      return;
-    }
-  } else {
-    dataSource = 'cloud';
-    bridgeOK = false;
-  }
-  try { localStorage.setItem('dataSource', dataSource); } catch (e) { /* ignore */ }
-  syncSourceUI();
-  toast(dataSource === 'tdx' ? '已切换至本地通达信数据源' : '已切换回云端数据源');
-  setLoading(true);
-  try {
-    saveScrolls();
-    await applyDay(state.date, { silent: true });
-    state.lastUpdate = new Date();
-    updateStatus();
-  } catch (e) {
-    toast('加载失败：' + e.message);
-  } finally {
-    setLoading(false);
-  }
-});
 ladderList.addEventListener('click', (e) => {
   const chip = e.target.closest('.stock-chip');
   if (!chip) return;
