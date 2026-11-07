@@ -546,7 +546,7 @@ async function fetchKline(s, date) {
 function drawNote(canvas, text) {
   const g = setupCanvas(canvas, 250);
   g.ctx.clearRect(0, 0, g.W, g.H);
-  g.ctx.fillStyle = '#8b949e';
+  g.ctx.fillStyle = '#7a8699';
   g.ctx.font = '12px sans-serif';
   g.ctx.textAlign = 'center';
   g.ctx.fillText(text, g.W / 2, g.H / 2);
@@ -568,8 +568,8 @@ function drawIntraday(canvas, preClose, points) {
   range = maxP - minP;
   function yOf(v) { return padT + plotH * (maxP - v) / range; }
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-  ctx.fillStyle = '#8b949e';
+  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
+  ctx.fillStyle = '#7a8699';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'left';
   for (let i = 0; i <= 4; i++) {
@@ -580,7 +580,7 @@ function drawIntraday(canvas, preClose, points) {
   }
 
   const ypc = yOf(preClose);
-  ctx.strokeStyle = '#9aa4b2';
+  ctx.strokeStyle = '#a9b4c4';
   ctx.setLineDash([4, 4]);
   ctx.beginPath(); ctx.moveTo(padL, ypc); ctx.lineTo(W - padR, ypc); ctx.stroke();
   ctx.setLineDash([]);
@@ -588,7 +588,7 @@ function drawIntraday(canvas, preClose, points) {
 
   const n = points.length;
   const last = points[n - 1].price;
-  const color = last >= preClose ? '#ff4d4f' : '#16c784';
+  const color = last >= preClose ? '#ff6a6a' : '#57d25c';
   const xs = points.map(function (p, i) { return padL + plotW * i / Math.max(1, n - 1); });
   ctx.beginPath();
   points.forEach(function (p, i) {
@@ -611,7 +611,7 @@ function drawIntraday(canvas, preClose, points) {
   ctx.fillStyle = grad;
   ctx.fill();
 
-  ctx.fillStyle = '#8b949e';
+  ctx.fillStyle = '#7a8699';
   ctx.textAlign = 'center';
   [[0, '09:30'], [0.25, '10:30'], [0.5, '11:30/13:00'], [0.75, '14:00'], [1, '15:00']].forEach(function (lb) {
     ctx.fillText(lb[1], padL + plotW * lb[0], H - 6);
@@ -634,8 +634,8 @@ function drawKlineChart(canvas, kl) {
   range = maxH - minL;
   function yOf(v) { return padT + plotH * (maxH - v) / range; }
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-  ctx.fillStyle = '#8b949e';
+  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
+  ctx.fillStyle = '#7a8699';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'left';
   for (let i = 0; i <= 4; i++) {
@@ -651,7 +651,7 @@ function drawKlineChart(canvas, kl) {
   kl.forEach(function (k, i) {
     const x = padL + step * (i + 0.5);
     const up = k.c >= k.o;
-    const color = up ? '#ff4d4f' : '#16c784';
+    const color = up ? '#ff6a6a' : '#57d25c';
     ctx.strokeStyle = color;
     ctx.lineWidth = 1;
     ctx.beginPath(); ctx.moveTo(x, yOf(k.h)); ctx.lineTo(x, yOf(k.l)); ctx.stroke();
@@ -663,7 +663,7 @@ function drawKlineChart(canvas, kl) {
     ctx.fill();
   });
 
-  ctx.fillStyle = '#8b949e';
+  ctx.fillStyle = '#7a8699';
   ctx.textAlign = 'center';
   [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i) {
     ctx.fillText(String(kl[i].date).slice(5), padL + step * (i + 0.5), H - 6);
@@ -1106,7 +1106,7 @@ function roundRect(ctx, x, y, w, h, r) {
 }
 
 function emptyChart(ctx, W, H) {
-  ctx.fillStyle = '#8b949e';
+  ctx.fillStyle = '#7a8699';
   ctx.font = '12px sans-serif';
   ctx.textAlign = 'center';
   ctx.fillText('暂无数据', W / 2, H / 2);
@@ -1123,8 +1123,8 @@ function drawVBar(canvas, labels, values, opts) {
   const plotW = W - padL - padR, plotH = H - padT - padB;
   const max = Math.max(1, Math.max.apply(null, values));
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.06)';
-  ctx.fillStyle = '#8b949e';
+  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
+  ctx.fillStyle = '#7a8699';
   ctx.font = '11px sans-serif';
   ctx.textAlign = 'right';
   const steps = 4;
@@ -1141,19 +1141,19 @@ function drawVBar(canvas, labels, values, opts) {
     const h = plotH * values[i] / max;
     const y = padT + plotH - h;
     const grad = ctx.createLinearGradient(0, y, 0, padT + plotH);
-    grad.addColorStop(0, opts.color || '#ff4d4f');
-    grad.addColorStop(1, opts.color2 || '#8f1f20');
+    grad.addColorStop(0, opts.color || '#ff6a6a');
+    grad.addColorStop(1, opts.color2 || '#ffc9c9');
     ctx.fillStyle = grad;
     roundRect(ctx, x - bw / 2, y, bw, Math.max(h, 0), 3);
     ctx.fill();
     if (values[i] > 0) {
-      ctx.fillStyle = '#e6edf3'; ctx.textAlign = 'center'; ctx.font = '11px sans-serif';
+      ctx.fillStyle = '#1f2733'; ctx.textAlign = 'center'; ctx.font = '11px sans-serif';
       ctx.fillText(String(values[i]), x, y - 4);
     }
     ctx.save();
     ctx.translate(x, padT + plotH + 10);
     ctx.rotate(-Math.PI / 4);
-    ctx.fillStyle = '#8b949e'; ctx.textAlign = 'right'; ctx.font = '11px sans-serif';
+    ctx.fillStyle = '#7a8699'; ctx.textAlign = 'right'; ctx.font = '11px sans-serif';
     ctx.fillText(lab, 0, 0);
     ctx.restore();
   });
@@ -1177,15 +1177,15 @@ function drawHBar(canvas, labels, values, opts) {
 
   labels.forEach((lab, i) => {
     const y = i * rowH + 6;
-    ctx.fillStyle = '#c9d1d9'; ctx.textAlign = 'right';
+    ctx.fillStyle = '#3a4556'; ctx.textAlign = 'right';
     ctx.fillText(lab, padL - 8, y + 13);
     const w = plotW * values[i] / max;
     const grad = ctx.createLinearGradient(padL, 0, padL + w, 0);
-    grad.addColorStop(0, '#ff7a45'); grad.addColorStop(1, '#ff4d4f');
+    grad.addColorStop(0, '#ffa06a'); grad.addColorStop(1, '#ff6a6a');
     ctx.fillStyle = grad;
     roundRect(ctx, padL, y + 3, Math.max(w, 1), rowH - 8, 3);
     ctx.fill();
-    ctx.fillStyle = '#e6edf3'; ctx.textAlign = 'left';
+    ctx.fillStyle = '#1f2733'; ctx.textAlign = 'left';
     ctx.fillText(String(values[i]), padL + w + 6, y + 13);
   });
 }

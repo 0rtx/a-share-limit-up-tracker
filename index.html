@@ -10,8 +10,8 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <div class="container">
-    <header class="topbar">
+  <header class="site-header">
+    <div class="container topbar">
       <div class="brand">
         <div class="logo">涨</div>
         <div>
@@ -23,11 +23,13 @@
         <button id="prevDay" class="icon-btn" title="上一交易日">‹</button>
         <input type="date" id="dateInput">
         <button id="nextDay" class="icon-btn" title="下一交易日">›</button>
-        <button id="todayBtn" class="ghost-btn">今天</button>
-        <button id="refreshBtn" class="ghost-btn">刷新</button>
+        <button id="todayBtn" class="primary-btn">今天</button>
+        <button id="refreshBtn" class="primary-btn">刷新</button>
       </div>
-    </header>
+    </div>
+  </header>
 
+  <div class="container">
     <div class="statusbar">
       <div class="left">
         <span class="live-dot" id="liveDot"></span>
