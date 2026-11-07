@@ -91,7 +91,8 @@ const state = {
   prevZt: null,
   auto: true,
   followLatest: true,
-  lastUpdate: null
+  lastUpdate: null,
+  qsError: false
 };
 
 let latestDate = null;
@@ -292,6 +293,7 @@ function updateStatus() {
 async function autoTick() {
   if (!state.auto) return;
   try {
+    saveScrolls();
     if (state.followLatest && isOnLatest && !isTradingHours()) {
       const probe = await fetchPool('zt', '20991231');
       const qd = probe.qdate || state.date;
@@ -315,6 +317,38 @@ async function autoTick() {
 /* ---------- rendering ---------- */
 function setDefaultSort(tab) { state.sort = tab === 'dt' ? { key: 'days', dir: -1 } : { key: 'fbt', dir: 1 }; }
 
+// 自动/手动刷新重新渲染时，保留表格内部滚动位置，避免用户浏览时被“拽回顶部”。
+// 板块/强势股表格是异步重建的，因此在每次重建后按槽位恢复并“消费”一次。
+let pendingScroll = null;
+function saveScrolls() {
+  const t = document.querySelector('.table-wrap');
+  const b = document.querySelector('#boardBody .board-table-wrap');
+  const s = document.querySelector('#strongBody .board-table-wrap');
+  pendingScroll = {
+    table: t ? { el: t, top: t.scrollTop, left: t.scrollLeft } : null,
+    board: b ? { el: b, top: b.scrollTop, left: b.scrollLeft } : null,
+    strong: s ? { el: s, top: s.scrollTop, left: s.scrollLeft } : null
+  };
+}
+function restoreScrolls() {
+  if (!pendingScroll) return;
+  const p = pendingScroll;
+  const fix = function (slot, sel) {
+    const info = p[slot];
+    if (!info) return;
+    const cur = document.querySelector(sel);
+    if (!cur) return;               // 容器当前不存在（如精选模式/空态），留给后续渲染
+    if (cur !== info.el) {          // 容器已重建才恢复并消费；仍是旧元素说明异步数据未到
+      cur.scrollTop = info.top;
+      cur.scrollLeft = info.left;
+      p[slot] = null;
+    }
+  };
+  fix('table', '.table-wrap');
+  fix('board', '#boardBody .board-table-wrap');
+  fix('strong', '#strongBody .board-table-wrap');
+}
+
 function renderAll(opts) {
   opts = opts || {};
   $('cntZt').textContent = state.data.zt.length;
@@ -329,6 +363,7 @@ function renderAll(opts) {
   renderTable();
   renderBoards();
   renderStrongPool();
+  restoreScrolls();
   if (!opts.skipPrev) refreshPrevDelta();
 }
 
@@ -714,7 +749,13 @@ function loadSinaBoards(type) {
     const script = document.createElement('script');
     let settled = false;
     const timer = setTimeout(function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块请求超时')); } }, 12000);
-    function cleanup() { delete window[meta.v]; if (script.parentNode) script.parentNode.removeChild(script); clearTimeout(timer); }
+    // 新浪的 JSONP 脚本用 var 声明全局变量，产生的 window 属性不可删除，
+    // 严格模式下 delete 会抛 TypeError（此前导致整个 Promise 卡死、板块一直“加载中”）。
+    function cleanup() {
+      try { delete window[meta.v]; } catch (e) { try { window[meta.v] = undefined; } catch (e2) { /* ignore */ } }
+      if (script.parentNode) script.parentNode.removeChild(script);
+      clearTimeout(timer);
+    }
     script.onload = function () {
       if (settled) return;
       const raw = window[meta.v];
@@ -724,7 +765,8 @@ function loadSinaBoards(type) {
       try { resolve(mapSinaBoards(raw)); } catch (e) { reject(e); }
     };
     script.onerror = function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块网络请求失败')); } };
-    script.src = meta.url;
+    // 追加时间戳避免浏览器缓存旧响应，保证每次刷新都能拉到最新板块数据
+    script.src = meta.url + (meta.url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
     document.head.appendChild(script);
   });
 }
@@ -861,6 +903,7 @@ function renderBoardTable(list) {
       '<td class="num">' + fmtMoney(b.f25) + '</td></tr>';
   }).join('') + '</tbody>';
   boardBody.innerHTML = '<div class="board-table-wrap"><table>' + head + body + '</table></div>';
+  restoreScrolls();
 }
 
 function renderBoards() {
@@ -891,7 +934,7 @@ function renderBoards() {
     if (boardCache[targetType] && boardCache[targetType].length) {
       toast('板块数据更新失败，显示最近一次数据');
     } else {
-      boardBody.innerHTML = '<div class="empty-note">加载失败，请稍后重试</div>';
+      boardBody.innerHTML = '<div class="empty-note">板块数据加载失败 <button class="ghost-btn small" data-retry-board>重试</button></div>';
     }
   });
 }
@@ -974,7 +1017,11 @@ function renderStrongPool() {
 
   const rows = getStrongRows();
   if (!rows.length) {
-    strongBody.innerHTML = '<div class="empty-note">' + (list.length ? '无匹配股票' : '暂无强势股池数据（可能为非交易日或数据尚未生成）') + '</div>';
+    let note;
+    if (list.length) note = '无匹配股票';
+    else if (state.qsError) note = '强势股池数据加载失败 <button class="ghost-btn small" data-retry-strong>重试</button>';
+    else note = '暂无强势股池数据（可能为非交易日或数据尚未生成）';
+    strongBody.innerHTML = '<div class="empty-note">' + note + '</div>';
     return;
   }
 
@@ -996,6 +1043,7 @@ function renderStrongPool() {
   }).join('') + '</tbody>';
 
   strongBody.innerHTML = '<div class="board-table-wrap strong-table-wrap"><table>' + head + body + '</table></div>';
+  restoreScrolls();
 }
 
 function exportStrongCSV() {
@@ -1260,16 +1308,18 @@ function renderIndustryOptions() {
 /* ---------- data loading ---------- */
 async function init() {
   clearTimeout(refreshTimer);
+  pendingScroll = null;
   setLoading(true);
   try {
     const [zt, zb, dt, qs] = await Promise.all([
       fetchPool('zt', '20991231'), fetchPool('zb', '20991231'), fetchPool('dt', '20991231'),
-      fetchStrongPool('20991231').catch(() => [])
+      fetchStrongPool('20991231').catch(() => null)
     ]);
     const qd = zt.qdate || todayStr();
     state.date = qd;
     dateInput.value = toInput(qd);
-    state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs };
+    state.qsError = qs == null;
+    state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs || [] };
     state.tab = 'zt';
     state.filters = { search: '', lbc: 'all', industry: '' };
     searchEl.value = ''; lbcEl.value = 'all';
@@ -1294,7 +1344,7 @@ async function applyDay(date, opts) {
   opts = opts || {};
   const [zt, zb, dt, qs] = await Promise.all([
     fetchPool('zt', date), fetchPool('zb', date), fetchPool('dt', date),
-    fetchStrongPool(date).catch(() => [])
+    fetchStrongPool(date).catch(() => null)
   ]);
   const qd = zt.qdate || date;
   const has = zt.list.length + zb.list.length + dt.list.length > 0;
@@ -1305,12 +1355,15 @@ async function applyDay(date, opts) {
   }
   state.date = actual;
   dateInput.value = toInput(actual);
-  state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs };
+  if (qs == null && !opts.silent) toast('强势股池数据更新失败，已保留上次数据');
+  state.qsError = qs == null;
+  state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs == null ? (state.data.qs || []) : qs };
   renderAll({ skipPrev: !!opts.skipPrev });
   return actual;
 }
 
 async function loadDate(date) {
+  pendingScroll = null;
   setLoading(true);
   try {
     await applyDay(date, {});
@@ -1324,6 +1377,7 @@ async function loadDate(date) {
 }
 
 async function nav(dir) {
+  pendingScroll = null;
   setLoading(true);
   try {
     const base = state.date || todayStr();
@@ -1351,6 +1405,58 @@ async function nav(dir) {
     toast(dir < 0 ? '未找到更早的交易日数据' : '已是最新交易日');
   } catch (e) {
     toast('导航失败：' + e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+// 刷新当前视图：保持当前日期/页签/筛选/排序不变，仅重新拉取数据
+async function refresh() {
+  setLoading(true);
+  try {
+    saveScrolls();
+    if (state.followLatest && isOnLatest) {
+      const probe = await fetchPool('zt', '20991231');
+      const qd = probe.qdate || state.date;
+      if (Number(qd) > Number(state.date)) {
+        latestDate = qd;
+        await applyDay(qd, { silent: true });
+        isOnLatest = true;
+      } else {
+        await applyDay(state.date, { silent: true });
+      }
+    } else {
+      await applyDay(state.date, { silent: true });
+    }
+    state.lastUpdate = new Date();
+    updateStatus();
+    toast('已刷新');
+  } catch (e) {
+    toast('刷新失败：' + e.message);
+  } finally {
+    setLoading(false);
+  }
+}
+
+// “今天”：跳回最新交易日并刷新数据
+async function goToday() {
+  pendingScroll = null;
+  setLoading(true);
+  try {
+    const probe = await fetchPool('zt', '20991231');
+    const qd = probe.qdate || state.date;
+    latestDate = qd;
+    if (Number(qd) === Number(state.date)) {
+      saveScrolls();
+      await applyDay(qd, { silent: true });
+    } else {
+      await applyDay(qd, {});
+    }
+    isOnLatest = true;
+    state.lastUpdate = new Date();
+    updateStatus();
+  } catch (e) {
+    toast('加载失败：' + e.message);
   } finally {
     setLoading(false);
   }
@@ -1424,8 +1530,8 @@ dateInput.addEventListener('change', () => {
 });
 $('prevDay').addEventListener('click', () => nav(-1));
 $('nextDay').addEventListener('click', () => nav(1));
-$('todayBtn').addEventListener('click', init);
-$('refreshBtn').addEventListener('click', init);
+$('todayBtn').addEventListener('click', goToday);
+$('refreshBtn').addEventListener('click', refresh);
 tabsEl.addEventListener('click', (e) => {
   const btn = e.target.closest('.tab');
   if (btn) setTab(btn.dataset.tab);
@@ -1487,6 +1593,11 @@ boardType.addEventListener('click', (e) => {
 });
 boardSearch.addEventListener('input', () => { renderBoardTable(boardState.list); });
 boardBody.addEventListener('click', (e) => {
+  if (e.target.closest('[data-retry-board]')) {
+    boardState.currentKey = null;
+    renderBoards();
+    return;
+  }
   const th = e.target.closest('th.sortable');
   if (!th) return;
   const k = th.dataset.bk;
@@ -1496,6 +1607,18 @@ boardBody.addEventListener('click', (e) => {
 });
 strongSearch.addEventListener('input', () => { strongState.search = strongSearch.value; renderStrongPool(); });
 strongBody.addEventListener('click', (e) => {
+  if (e.target.closest('[data-retry-strong]')) {
+    strongBody.innerHTML = '<div class="empty-note">加载中…</div>';
+    fetchStrongPool(state.date).then(function (list) {
+      state.data.qs = list;
+      state.qsError = false;
+      renderStrongPool();
+    }).catch(function () {
+      state.qsError = true;
+      renderStrongPool();
+    });
+    return;
+  }
   const th = e.target.closest('th.sortable');
   if (th) {
     const k = th.dataset.k;
