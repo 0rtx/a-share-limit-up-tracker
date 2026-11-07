@@ -1,3 +1,5 @@
 .tools/
 *.log
 *.err
+bridge/cache/
+bridge/__pycache__/
