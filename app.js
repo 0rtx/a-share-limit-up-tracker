@@ -1170,6 +1170,25 @@ function intraBars(m, fake) {
   return m.bars.map((b) => ({ ...b, fake, t: b.t || labelOfSlot(b.slot) }));
 }
 
+/** 分时兜底：腾讯 1 分钟线，只取最后交易日 */
+async function intraFromTx(code) {
+  const all = await klineTx(code, '1');
+  if (!all || !all.length) return null;
+  const last = all[all.length - 1];
+  const day = String(last.t).slice(0, 8);
+  const seg = all.filter((b) => String(b.t).slice(0, 8) === day);
+  if (seg.length < 2) return null;
+  const bars = [];
+  for (const b of seg) {
+    const s = String(b.t);
+    const hh = +s.slice(8, 10), mm = +s.slice(10, 12);
+    if (!(hh >= 9 && hh <= 15)) continue;
+    bars.push({ ...b, slot: slotOf(hh * 60 + mm), t: `${s.slice(8, 10)}:${s.slice(10, 12)}` });
+  }
+  if (bars.length < 2) return null;
+  return { pre: bars[0].o, bars, fake: false, src: 'tx' };
+}
+
 async function openStock(code, name) {
   $('#modalTitle').innerHTML = `${esc(name || code)}<span class="sub">${code}</span>`;
   $('#modal').classList.add('on');
@@ -1218,13 +1237,15 @@ async function setStockPeriod(period) {
     }
     const m = S.minute.get(code);
     applyBars(m ? intraBars(m) : null, m ? m.pre : null, m ? !!m.fake : false);
-    try {
-      const mm = await fetchMinute(code);
-      if (mm && mm.bars && mm.bars.length > 1 && S.stock && S.stock.code === code && S.stock.period === 'intra') {
-        S.minute.set(code, mm);
-        applyBars(intraBars(mm), mm.pre, false);
-      }
-    } catch (e) { /* keep fallback */ }
+    let mm = null;
+    try { mm = await fetchMinute(code); } catch (e) { mm = null; }
+    if (!mm || !mm.bars || mm.bars.length < 2) {
+      try { mm = await intraFromTx(code); } catch (e) { mm = null; }
+    }
+    if (mm && mm.bars && mm.bars.length > 1 && S.stock && S.stock.code === code && S.stock.period === 'intra') {
+      S.minute.set(code, mm);
+      applyBars(intraBars(mm), mm.pre, false);
+    }
     return;
   }
 
