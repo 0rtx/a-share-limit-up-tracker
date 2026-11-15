@@ -21,6 +21,7 @@ const API = {
   TX_KLINE3: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
   TX_MKLINE: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline',
   TX_MKLINE2: 'https://ifzq.gtimg.cn/appstock/app/kline/mkline',
+  THS_BK: 'https://d.10jqka.com.cn/v6/line/',
 };
 const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
 
@@ -2056,6 +2057,113 @@ async function loadStrategyKlines() {
   if (S.view === 'strategy') renderStrategy();
 }
 
+/* ---- 行业概念板块 KDJ：同花顺板块日K last300.js（CORS *），周/月聚合 ---- */
+const BK_CACHE = 'bkcache_';
+let _bkTok = 0;
+function prevDateStr(d) {
+  const y = +d.slice(0, 4), m = +d.slice(4, 6) - 1, dd = +d.slice(6, 8);
+  const dt = new Date(Date.UTC(y, m, dd)); dt.setUTCDate(dt.getUTCDate() - 1);
+  return dt.toISOString().slice(0, 10).replace(/-/g, '');
+}
+/* 板块宇宙：近 60 个自然日的 block_top（有涨停股出现的行业/概念板块）合并去重 */
+async function fetchBoardUniverse(startDate) {
+  const map = new Map();
+  let d = startDate;
+  for (let i = 0; i < 60; i++) {
+    const list = await fetchThsBlocks(d).catch(() => []);
+    for (const b of list) if (!map.has(b.name)) map.set(b.name, { code: b.code, name: b.name, chg: b.chg, zt: b.zt });
+    d = prevDateStr(d);
+  }
+  return Array.from(map.values());
+}
+async function fetchThsBkKline(code) {
+  const base = API.THS_BK + 'bk_' + code + '/01/last300.js';
+  let txt = null;
+  for (const u of [base.replace('/v6/', '/v4/'), base]) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 9000);
+    try {
+      const r = await fetch(u, { signal: ctl.signal, cache: 'no-store' });
+      if (r.ok) txt = await r.text();
+    } catch (e) { txt = null; }
+    clearTimeout(t);
+    if (txt && txt.indexOf('({') > 0) break;
+  }
+  if (!txt || txt.indexOf('({') < 0) throw new Error('bad');
+  const i = txt.indexOf('({');
+  const j = JSON.parse(txt.slice(i + 1, txt.lastIndexOf('})') + 1));
+  if (!j || !j.data) throw new Error('bad');
+  return String(j.data).split(';').filter(Boolean).map((seg) => {
+    const p = seg.split(',');
+    return { t: p[0], o: +p[1], h: +p[2], l: +p[3], c: +p[4], v: +p[5] || 0 };
+  });
+}
+async function loadBkKlines() {
+  if (S._bkLoading || S._bkReady) return;
+  if (!S._bkList) {
+    let cached = null;
+    try { cached = JSON.parse(localStorage.getItem('thsbk_list') || 'null'); } catch (e) { cached = null; }
+    if (cached && Array.isArray(cached) && cached.length > 10) S._bkList = cached;
+  }
+  if (!S._bkList) {
+    S._bkList = await fetchBoardUniverse(S.day.date).catch(() => []);
+    if (S._bkList.length > 10) { try { localStorage.setItem('thsbk_list', JSON.stringify(S._bkList)); } catch (e) { /* quota */ } }
+  }
+  const blocks = S._bkList;
+  if (!blocks.length) { S._bkReady = true; return; }
+  const tok = ++_bkTok;
+  S._bkLoading = true; S._bkTotal = blocks.length; S._bkDone = 0; S._bkFail = 0;
+  S._bk = {};
+  const missing = blocks.filter((b) => !S._bk[b.code]);
+  await mapLimit(missing, 4, async (b, idx) => {
+    let bars = null;
+    try { bars = await fetchThsBkKline(b.code); } catch (e) { bars = null; }
+    if (tok !== _bkTok) return;
+    S._bk[b.code] = bars;
+    if (!bars || !bars.length) S._bkFail++;
+    S._bkDone++;
+    if (idx % 20 === 0) await sleep(250);
+    if (S.view === 'strategy' && S._bkDone % 10 === 0) renderStrategy();
+  });
+  if (tok !== _bkTok) return;
+  S._bkLoading = false;
+  S._bkReady = true;
+  if (S.view === 'strategy') renderStrategy();
+}
+/* 三周期共振：日线 J 上窜 K（多头排列）、周线三线粘合、月线 KDJ 上翘；≥2 项即命中，全中排前 */
+function runBkKdj() {
+  const ztMap = new Map((S.day.blocks || []).map((b) => [b.name, b]));
+  const rows = [];
+  for (const b of (S._bkList || [])) {
+    const day = S._bk[b.code];
+    if (!day || day.length < 120) continue;
+    const wk = aggregateBars(day, 'week');
+    const mo = aggregateBars(day, 'month');
+    const d = kdjOfBars(day), w = kdjOfBars(wk), m = kdjOfBars(mo);
+    if (!d || !w || !m || d.K.length < 3 || w.K.length < 2 || m.K.length < 2) continue;
+    const dn = d.K.length - 1, wn = w.K.length - 1, mn = m.K.length - 1;
+    const jUpK = d.J[dn] > d.K[dn] && d.K[dn] > d.D[dn];
+    const wSpan = Math.max(w.K[wn], w.D[wn], w.J[wn]) - Math.min(w.K[wn], w.D[wn], w.J[wn]);
+    const wStick = wSpan <= 12;
+    const mUp = m.K[mn] > m.K[mn - 1];
+    const score = (jUpK ? 1 : 0) + (wStick ? 1 : 0) + (mUp ? 1 : 0);
+    if (score < 2) continue;
+    const zt = ztMap.get(b.name);
+    const tags = [jUpK ? '日J上窜K' : '', wStick ? '周粘合' : '', mUp ? '月KDJ上翘' : ''].filter(Boolean).join(' · ');
+    rows.push({
+      bk: b.code,
+      nm: b.name,
+      name: b.name,
+      chg: zt ? zt.chg : null,
+      reason: tags + (zt ? ' · 今日涨停' + zt.zt + '家' : '') + ' · 周差' + wSpan.toFixed(1),
+      score,
+      wSpan,
+    });
+  }
+  rows.sort((a, b) => (b.score - a.score) || (a.wSpan - b.wSpan) || ((ztMap.get(b.nm) ? ztMap.get(b.nm).zt : 0) - (ztMap.get(a.nm) ? ztMap.get(a.nm).zt : 0)));
+  return rows.slice(0, 20);
+}
+
 const STRATEGIES = [
   { id: 'first', name: '首板优选', tag: '打板', desc: '今日首板中封单最足、封板最早、换手健康的前 10 只', run: runFirst },
   { id: 'promote', name: '一进二晋级', tag: '打板', desc: '昨日首板、今日再度封板，短线最经典的打板晋级', run: runPromote },
@@ -2067,6 +2175,7 @@ const STRATEGIES = [
   { id: 'kdjw', name: 'KDJ周线上翘', tag: '指标', desc: '周线KDJ(9,3,3)三线低位粘合、K上穿D后继续上翘（近5日涨停池内筛选，显示前20只）', needsKl: true, run: runKdjWeek },
   { id: 'kdjm', name: 'KDJ月线上翘', tag: '指标', desc: '月线KDJ(9,3,3)三线低位粘合、K上穿D后继续上翘（近5日涨停池内筛选，显示前20只）', needsKl: true, run: runKdjMonth },
   { id: 'volume', name: '放量启动', tag: '指标', desc: '量比≥2.5、今日涨2~7%且未涨停，资金进场信号（近5日涨停池内筛选）', needsKl: true, run: runVolume },
+  { id: 'bkkdj', name: '行业概念KDJ共振', tag: '指标', desc: '近三个月有涨停的行业/概念板块指数：日线J上窜K、周线三线粘合（差≤12）、月线KDJ上翘，满足≥2项即命中、全中排前（最多20个）', needsBk: true, unit: '个', run: runBkKdj },
   { id: 'dtd', name: '地天板', tag: '反包', desc: '昨日跌停、今日涨停的极端反转，辨识度极高', run: runDtd },
   { id: 'oneword', name: '一字加速', tag: '情绪', desc: '开盘即封死、几乎无换手的一字板，资金一致性最强', run: runOneword },
 ];
@@ -2076,6 +2185,7 @@ async function loadStrategyExtras(date) {
   if (_extrasDate === date) return;
   _extrasDate = date;
   if (S._klDate !== date) { S._klDate = date; S._kl = {}; S._klReady = false; S._klLoading = false; _klTok++; }
+  if (S._bkDate !== date) { S._bkDate = date; S._bk = {}; S._bkReady = false; S._bkLoading = false; _bkTok++; }
   const prevDate = S.day && S.day.prevDate;
   if (!prevDate) { _extrasDate = null; return; }
   const [prevZb, prevDt, recentZt] = await Promise.all([
@@ -2093,7 +2203,7 @@ async function loadStrategyExtras(date) {
     for (const [k, v] of extra) S.quotes.set(k, v);
     if (!S.day || S.day.date !== date) return;
   }
-  if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); }
+  if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); }
 }
 
 async function fetchRecentZt(endDate, days) {
@@ -2115,25 +2225,26 @@ function renderStrategy() {
   const readyBase = !!(S.day.prevZb && S.day.prevDt && S.day.recentZt);
   grid.innerHTML = STRATEGIES.map((st) => {
     let hits = [];
-    const ready = st.needsKl ? readyBase && !!S._klReady : readyBase;
+    const ready = (st.needsKl || st.needsBk) ? readyBase && (st.needsKl ? !!S._klReady : true) && (st.needsBk ? !!S._bkReady : true) : readyBase;
     if (ready) {
       try { hits = st.run() || []; } catch (e) { console.error(st.id, e); }
     }
     const cells = hits.length
       ? hits.map((x) => {
           const ccls = x.chg == null ? 'flat' : x.chg > 0 ? 'up' : x.chg < 0 ? 'down' : 'flat';
-          return '<button class="sh" data-code="' + x.code + '" title="' + esc(x.reason) + '">'
-            + '<i class="mk">' + mkName(x.code) + '</i>'
+          return '<button class="sh" ' + (x.bk ? 'data-bk="' + x.bk + '" data-nm="' + esc(x.nm || x.name) + '"' : 'data-code="' + x.code + '"') + ' title="' + esc(x.reason) + '">'
+            + '<i class="mk">' + (x.bk ? '板' : mkName(x.code)) + '</i>'
             + '<b class="sh-nm">' + esc(x.name) + '</b>'
             + '<span class="sh-chg ' + ccls + '">' + fmtPct(x.chg, false) + '</span>'
             + '<span class="sh-reason">' + esc(x.reason) + '</span></button>';
         }).join('')
       : '<div class="sh-empty">' + (ready
-          ? ((st.needsKl && S._klFail >= (S._klTotal || 1) * 0.9) ? 'K线数据加载失败（' + (S._klFail || 0) + '/' + (S._klTotal || 0) + ' 只）<a class="retry">点此重试</a>' : '今日无命中')
-          : (st.needsKl ? 'K线计算中… ' + (S._klDone || 0) + '/' + (S._klTotal || 0) : '数据加载中…')) + '</div>';
+          ? ((st.needsKl && S._klFail >= (S._klTotal || 1) * 0.9) ? 'K线数据加载失败（' + (S._klFail || 0) + '/' + (S._klTotal || 0) + ' 只）<a class="retry">点此重试</a>'
+            : (st.needsBk && S._bkFail >= (S._bkTotal || 1) * 0.9) ? '板块K线加载失败（' + (S._bkFail || 0) + '/' + (S._bkTotal || 0) + ' 个）<a class="retry">点此重试</a>' : '今日无命中')
+          : (st.needsKl ? 'K线计算中… ' + (S._klDone || 0) + '/' + (S._klTotal || 0) : st.needsBk ? '板块K线计算中… ' + (S._bkDone || 0) + '/' + (S._bkTotal || 0) : '数据加载中…')) + '</div>';
     return '<div class="strategy-card">'
       + '<div class="strategy-head"><b>' + st.name + '</b><span class="strategy-tag">' + st.tag + '</span>'
-      + '<span class="strategy-count">' + (ready ? hits.length + ' 只' : (st.needsKl ? '计算中' : '')) + '</span>'
+      + '<span class="strategy-count">' + (ready ? hits.length + ' ' + (st.unit || '只') : ((st.needsKl || st.needsBk) ? '计算中' : '')) + '</span>'
       + '<p class="strategy-desc">' + st.desc + '</p></div>'
       + '<div class="strategy-hits">' + cells + '</div></div>';
   }).join('');
@@ -2147,7 +2258,7 @@ function bindEvents() {
     S.view = btn.dataset.view;
     $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
     ['relay', 'sector', 'list', 'strategy'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
-    if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); }
+    if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); }
     if (S.view === 'sector') {
       if (!S.boardCurves) renderSector();
       else requestAnimationFrame(() => requestAnimationFrame(() => drawSectorChart()));
@@ -2195,6 +2306,12 @@ function bindEvents() {
 
   $('#strategyGrid').addEventListener('click', (e) => {
     if (e.target.classList && e.target.classList.contains('retry')) {
+      if (S._bkFail >= (S._bkTotal || 1) * 0.9 && !S._bkReady) {
+        S._bkReady = false; S._bkLoading = false;
+        try { localStorage.removeItem(BK_CACHE + (S.day.date || '')); } catch (err) {}
+        loadBkKlines().catch(() => {});
+        return;
+      }
       S._klReady = false;
       S._klLoading = false;
       try { localStorage.removeItem(KL_CACHE + (S.day.date || '')); } catch (err) {}
@@ -2202,7 +2319,16 @@ function bindEvents() {
       return;
     }
     const btn = e.target.closest('.sh');
-    if (btn) openStock(btn.dataset.code);
+    if (!btn) return;
+    if (btn.dataset.bk) {
+      const tab = document.querySelector('#viewTabs button[data-view="sector"]');
+      if (tab) tab.click();
+      const row = document.querySelector('#sectorList .srow[data-board="' + CSS.escape(btn.dataset.nm) + '"]');
+      if (row) { if (!row.classList.contains('on')) row.click(); }
+      else toast('该板块今日无涨停股，暂无分时曲线');
+      return;
+    }
+    openStock(btn.dataset.code);
   });
 
   $('#sectorList').addEventListener('click', (e) => {
