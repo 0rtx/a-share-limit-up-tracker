@@ -145,6 +145,24 @@ input[type=date] {
 .tabs button:hover { color: var(--accent); }
 .tabs button.on { background: var(--up-soft); color: var(--up); border-color: #ffd9d6; font-weight: 600; }
 
+/* 晋级开关 */
+.promote {
+  display: inline-flex; align-items: center; gap: 7px; margin-left: auto;
+  border: 1px solid var(--border); background: var(--panel2); color: #55617a;
+  padding: 4px 12px 4px 6px; border-radius: 999px; font-size: 12.5px; cursor: pointer; transition: .15s;
+}
+.promote .pt {
+  width: 28px; height: 16px; border-radius: 999px; background: #d7dee9; position: relative; transition: .18s;
+}
+.promote .pt::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(16,24,40,.25); transition: .18s;
+}
+.promote.on { background: var(--up-soft); border-color: #ffd9d6; color: var(--up); font-weight: 600; }
+.promote.on .pt { background: var(--up); }
+.promote.on .pt::after { left: 14px; }
+.promote:hover { border-color: #ffd9d6; }
+
 /* ---------- chips ---------- */
 .chips {
   display: flex; gap: 8px; flex-wrap: wrap; align-items: center;

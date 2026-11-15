@@ -27,6 +27,7 @@ const S = {
   view: 'relay',
   rule: 'hot',
   chip: null,
+  promoteOnly: false,  // 只看晋级成功
   tab: 'zt',
   search: '',
   level: '',
@@ -538,10 +539,13 @@ function renderLadder() {
     let codes = groups.get(lv) || [];
     if (chipSet) codes = codes.filter((c) => chipSet.has(c));
     if (!codes.length) continue;
-    const items = buildItems(codes, srcMap);
+    let items = buildItems(codes, srcMap);
     const succ = items.filter((i) => i.status === 'up').length;
+    const total = items.length;
+    if (S.promoteOnly) items = items.filter((i) => i.status === 'up');
+    if (!items.length) continue;
     items.sort(RULES[S.rule] || RULES.hot);
-    rows.push(rowHtml(`${lv}进${lv + 1}`, `${succ}/${items.length}`, items.length ? (succ / items.length) * 100 : 0, items));
+    rows.push(rowHtml(`${lv}进${lv + 1}`, `${succ}/${total}`, total ? (succ / total) * 100 : 0, items));
   }
 
   // 首板行 = 今日首板
@@ -555,7 +559,7 @@ function renderLadder() {
     rows.push(rowHtml('首板', `${items.length}/${totalToday}`, pct, items));
   }
 
-  $('#ladder').innerHTML = rows.join('') || '<div class="empty">该板块今日无涨停</div>';
+  $('#ladder').innerHTML = rows.join('') || `<div class="empty">${S.promoteOnly ? '今日没有晋级成功的股票' : '该板块今日无涨停'}</div>`;
 }
 
 function memberSet(name) {
@@ -1738,6 +1742,13 @@ function bindEvents() {
     if (!btn) return;
     S.rule = btn.dataset.rule;
     $$('#ruleTabs button').forEach((b) => b.classList.toggle('on', b === btn));
+    renderLadder();
+  });
+
+  $('#promoteBtn').addEventListener('click', (e) => {
+    S.promoteOnly = !S.promoteOnly;
+    e.currentTarget.classList.toggle('on', S.promoteOnly);
+    e.currentTarget.setAttribute('aria-pressed', String(S.promoteOnly));
     renderLadder();
   });
 
