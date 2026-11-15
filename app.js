@@ -16,11 +16,11 @@ const API = {
   EM_QUOTE: 'https://push2.eastmoney.com/api/qt/ulist.np/get',
   EM_TREND: 'https://push2.eastmoney.com/api/qt/stock/trends2/get',
   EM_KLINE: 'https://push2his.eastmoney.com/api/qt/stock/kline/get',
-  TX_KLINE: 'https://ifzq.gtimg.cn/appstock/app/fqkline/get',
-  TX_KLINE2: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get',
+  TX_KLINE: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get',
+  TX_KLINE2: 'https://ifzq.gtimg.cn/appstock/app/fqkline/get',
   TX_KLINE3: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
-  TX_MKLINE: 'https://ifzq.gtimg.cn/appstock/app/kline/mkline',
-  TX_MKLINE2: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline',
+  TX_MKLINE: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline',
+  TX_MKLINE2: 'https://ifzq.gtimg.cn/appstock/app/kline/mkline',
 };
 const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
 
