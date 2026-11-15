@@ -341,7 +341,7 @@ async function loadDay(date, opts = {}) {
     const quotes = await fetchQuotes(allCodes).catch(() => new Map());
 
     S.quotes = quotes;
-    S.day = { zt, zb, dt, prev: prevInfo.pool, prevDate: prevInfo.date, blocks };
+    S.day = { date: useDate, zt, zb, dt, prev: prevInfo.pool, prevDate: prevInfo.date, blocks };
     S._lv = null;
 
     // 代码 -> 所属板块
@@ -366,6 +366,7 @@ async function loadDay(date, opts = {}) {
     }
 
     renderAll();
+    loadStrategyExtras(useDate).catch(() => {});
     const t = new Date();
     const hm = `${pad2(t.getHours())}:${pad2(t.getMinutes())}:${pad2(t.getSeconds())}`;
     S.lastUpdate = hm;
@@ -437,6 +438,7 @@ function renderAll() {
   renderLadder();
   renderSector();
   renderList();
+  renderStrategy();
 }
 
 function renderStats() {
@@ -1723,6 +1725,176 @@ function exportCSV() {
   URL.revokeObjectURL(a.href);
 }
 
+
+/* ---------------------------- 策略选股 ---------------------------- */
+function fmtAmt(v) {
+  if (v == null || isNaN(v) || v <= 0) return '—';
+  return v >= 1e8 ? (v / 1e8).toFixed(2) + '亿' : (v / 1e4).toFixed(0) + '万';
+}
+
+/* 命中条目：code、名称、今日涨幅、理由、连板高度 */
+function sh(code, name, reason, level, score) {
+  const chg = chgOf(code, null);
+  return { code, name: name || code, chg, reason, level: level || 1, score: score || 0 };
+}
+
+/* 首板优选：首板中封单足、封得早、换手健康 */
+function runFirst() {
+  return S.day.zt
+    .filter((s) => lvOf(s.code) === 1)
+    .filter((s) => s.turnover >= 3 && s.turnover <= 30 && s.orderAmt >= 5e7)
+    .sort((a, b) => (b.orderAmt - a.orderAmt) || (a.first - b.first))
+    .slice(0, 10)
+    .map((s) => sh(s.code, s.name, '封单' + fmtAmt(s.orderAmt) + ' · 首封' + fmtTs(s.first).slice(0, 5) + ' · 换手' + pctOf(s.turnover), 1, s.orderAmt));
+}
+
+/* 一进二：昨日首板、今日晋级 */
+function runPromote() {
+  const t = todayMap();
+  const lv = todayLevels();
+  return (S.day.prev || [])
+    .filter((p) => (p.level || 1) === 1)
+    .filter((p) => t.has(p.code))
+    .sort((a, b) => lv.get(b.code) - lv.get(a.code))
+    .map((p) => sh(p.code, p.name, '昨日首板 → 今日' + lv.get(p.code) + '板', lv.get(p.code)));
+}
+
+/* 高标龙头：全市场最高板 */
+function runLeader() {
+  const lv = todayLevels();
+  let mx = 0;
+  for (const v of lv.values()) if (v > mx) mx = v;
+  if (mx < 2) return [];
+  return S.day.zt
+    .filter((s) => lv.get(s.code) === mx)
+    .map((s) => sh(s.code, s.name, '全市场最高 ' + mx + ' 板 · ' + (s.reason || s.type || ''), mx, s.orderAmt));
+}
+
+/* 炸板回封：开过板但最终封住 */
+function runReseal() {
+  return S.day.zt
+    .filter((s) => (s.openNum || 0) >= 1)
+    .sort((a, b) => (b.openNum - a.openNum) || (a.first - b.first))
+    .map((s) => sh(s.code, s.name, '开板' + s.openNum + '次后回封 · 最后封板' + fmtTs(s.last).slice(0, 5)));
+}
+
+/* 涨停反包：昨日炸板、今日涨停 */
+function runReversal() {
+  const t = todayMap();
+  return (S.day.prevZb || [])
+    .filter((z) => t.has(z.code))
+    .map((z) => sh(z.code, z.name, '昨日炸板' + (z.chg != null ? ' ' + fmtPct(z.chg, false) : '') + ' → 今日涨停'));
+}
+
+/* 龙回头低吸：近5日曾涨停、今日未涨停但温和上涨 */
+function runPullback() {
+  const t = todayMap();
+  const hits = [];
+  for (const r of (S.day.recentZt || [])) {
+    if (t.has(r.code)) continue;
+    const qv = q(r.code);
+    if (!qv || qv.chg == null || qv.chg < 2 || qv.chg > 6) continue;
+    if (qv.turnover != null && qv.turnover < 3) continue;
+    hits.push(sh(r.code, r.name, r.day.slice(4, 6) + '月' + r.day.slice(6, 8) + '日涨停 · 今日' + fmtPct(qv.chg, false) + ' · 换手' + pctOf(qv.turnover)));
+  }
+  return hits.sort((a, b) => b.chg - a.chg).slice(0, 10);
+}
+
+/* 地天板：昨日跌停、今日涨停 */
+function runDtd() {
+  const t = todayMap();
+  return (S.day.prevDt || [])
+    .filter((z) => t.has(z.code))
+    .map((z) => sh(z.code, z.name, '昨日跌停 → 今日涨停'));
+}
+
+/* 一字加速：开盘即封死、几乎无换手 */
+function runOneword() {
+  return S.day.zt
+    .filter((s) => {
+      if (!s.first || s.first <= 0) return false;
+      const d = new Date(+s.first * 1000 + 8 * 3600 * 1000);
+      const min = d.getUTCHours() * 60 + d.getUTCMinutes();
+      return min <= 566 && s.turnover < 1.5;
+    })
+    .map((s) => sh(s.code, s.name, '首封' + fmtTs(s.first).slice(0, 5) + ' · 换手' + pctOf(s.turnover)));
+}
+
+const STRATEGIES = [
+  { id: 'first', name: '首板优选', tag: '打板', desc: '今日首板中封单最足、封板最早、换手健康的前 10 只', run: runFirst },
+  { id: 'promote', name: '一进二晋级', tag: '打板', desc: '昨日首板、今日再度封板，短线最经典的打板晋级', run: runPromote },
+  { id: 'leader', name: '高标龙头', tag: '情绪', desc: '全市场今日最高连板的股票，市场情绪总龙头', run: runLeader },
+  { id: 'reseal', name: '炸板回封', tag: '打板', desc: '今日盘中开过板、尾盘仍封住涨停，分歧转一致', run: runReseal },
+  { id: 'reversal', name: '涨停反包', tag: '反包', desc: '昨日炸板、今日直接涨停反包，弱转强信号', run: runReversal },
+  { id: 'pullback', name: '龙回头低吸', tag: '低吸', desc: '近 5 日曾涨停、今日未涨停但温和放量上涨，强势股资金回流', run: runPullback },
+  { id: 'dtd', name: '地天板', tag: '反包', desc: '昨日跌停、今日涨停的极端反转，辨识度极高', run: runDtd },
+  { id: 'oneword', name: '一字加速', tag: '情绪', desc: '开盘即封死、几乎无换手的一字板，资金一致性最强', run: runOneword },
+];
+
+let _extrasDate = null;
+async function loadStrategyExtras(date) {
+  if (_extrasDate === date) return;
+  _extrasDate = date;
+  const prevDate = S.day && S.day.prevDate;
+  if (!prevDate) { _extrasDate = null; return; }
+  const [prevZb, prevDt, recentZt] = await Promise.all([
+    fetchEmPool('zb', prevDate).catch(() => []),
+    fetchEmPool('dt', prevDate).catch(() => []),
+    fetchRecentZt(date, 5).catch(() => []),
+  ]);
+  if (!S.day || S.day.date !== date) return;
+  S.day.prevZb = prevZb;
+  S.day.prevDt = prevDt;
+  S.day.recentZt = recentZt;
+  const need = recentZt.map((r) => r.code).filter((c) => !S.quotes.has(c));
+  if (need.length) {
+    const extra = await fetchQuotes(need).catch(() => new Map());
+    for (const [k, v] of extra) S.quotes.set(k, v);
+    if (!S.day || S.day.date !== date) return;
+  }
+  if (S.view === 'strategy') renderStrategy();
+}
+
+async function fetchRecentZt(endDate, days) {
+  const seen = new Map();
+  for (let i = 1; i <= days; i++) {
+    const d = shiftDay(endDate, -i);
+    const pool = await fetchThsPool(d).catch(() => []);
+    for (const st of pool) {
+      if (!seen.has(st.code)) seen.set(st.code, { code: st.code, name: st.name, level: st.level || 1, day: d });
+    }
+  }
+  return Array.from(seen.values());
+}
+
+function renderStrategy() {
+  const grid = $('#strategyGrid');
+  if (!grid) return;
+  if (!S.day) { grid.innerHTML = ''; return; }
+  const ready = !!(S.day.prevZb && S.day.prevDt && S.day.recentZt);
+  grid.innerHTML = STRATEGIES.map((st) => {
+    let hits = [];
+    if (ready) {
+      try { hits = st.run() || []; } catch (e) { console.error(st.id, e); }
+    }
+    const cells = hits.length
+      ? hits.map((x) => {
+          const ccls = x.chg == null ? 'flat' : x.chg > 0 ? 'up' : x.chg < 0 ? 'down' : 'flat';
+          return '<button class="sh" data-code="' + x.code + '" title="' + esc(x.reason) + '">'
+            + '<i class="mk">' + mkName(x.code) + '</i>'
+            + '<b class="sh-nm">' + esc(x.name) + '</b>'
+            + '<span class="sh-chg ' + ccls + '">' + fmtPct(x.chg, false) + '</span>'
+            + '<span class="sh-reason">' + esc(x.reason) + '</span></button>';
+        }).join('')
+      : '<div class="sh-empty">' + (ready ? '今日无命中' : '数据加载中…') + '</div>';
+    return '<div class="strategy-card">'
+      + '<div class="strategy-head"><b>' + st.name + '</b><span class="strategy-tag">' + st.tag + '</span>'
+      + '<span class="strategy-count">' + (ready ? hits.length + ' 只' : '') + '</span>'
+      + '<p class="strategy-desc">' + st.desc + '</p></div>'
+      + '<div class="strategy-hits">' + cells + '</div></div>';
+  }).join('');
+}
+
 /* ---------------------------- events ---------------------------- */
 function bindEvents() {
   $('#viewTabs').addEventListener('click', (e) => {
@@ -1730,7 +1902,8 @@ function bindEvents() {
     if (!btn) return;
     S.view = btn.dataset.view;
     $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
-    ['relay', 'sector', 'list'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
+    ['relay', 'sector', 'list', 'strategy'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
+    if (S.view === 'strategy') renderStrategy();
     if (S.view === 'sector') {
       if (!S.boardCurves) renderSector();
       else requestAnimationFrame(() => requestAnimationFrame(() => drawSectorChart()));
@@ -1774,6 +1947,12 @@ function bindEvents() {
     const secTip = $('#sectorTip');
     if (secTip) secTip.classList.remove('on');
     drawSectorChart();
+  });
+
+  $('#strategyGrid').addEventListener('click', (e) => {
+    const el = e.target.closest('.sh');
+    if (!el) return;
+    openStock(el.dataset.code, el.querySelector('.sh-nm').textContent);
   });
 
   $('#sectorList').addEventListener('click', (e) => {
