@@ -2203,7 +2203,7 @@ async function loadStrategyExtras(date) {
     for (const [k, v] of extra) S.quotes.set(k, v);
     if (!S.day || S.day.date !== date) return;
   }
-  if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); }
+  if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); requestAnimationFrame(() => requestAnimationFrame(layoutStrategyMasonry)); }
 }
 
 async function fetchRecentZt(endDate, days) {
@@ -2216,6 +2216,27 @@ async function fetchRecentZt(endDate, days) {
     }
   }
   return Array.from(seen.values());
+}
+
+/* 卡片高度自适应：按内容高度计算 grid 行跨度，消除行间大片空白 */
+function layoutStrategyMasonry() {
+  const grid = $('#strategyGrid');
+  if (!grid || !grid.children.length) return;
+  const view = $('#viewStrategy');
+  if (view && view.classList.contains('hidden')) return;
+  const cards = Array.from(grid.children);
+  cards.forEach((c) => { c.style.gridRowEnd = 'auto'; });
+  const cs = getComputedStyle(grid);
+  const rowGap = parseFloat(cs.rowGap) || 12;
+  const unit = parseFloat(cs.gridAutoRows) || 8;
+  const step = unit + rowGap;
+  const hs = cards.map((c) => c.getBoundingClientRect().height);
+  cards.forEach((c, i) => {
+    const h = hs[i];
+    if (!h) return;
+    const span = Math.max(1, Math.ceil((h + rowGap) / step));
+    c.style.gridRowEnd = 'span ' + span;
+  });
 }
 
 function renderStrategy() {
@@ -2248,6 +2269,7 @@ function renderStrategy() {
       + '<p class="strategy-desc">' + st.desc + '</p></div>'
       + '<div class="strategy-hits">' + cells + '</div></div>';
   }).join('');
+  requestAnimationFrame(layoutStrategyMasonry);
 }
 
 /* ---------------------------- events ---------------------------- */
@@ -2258,7 +2280,7 @@ function bindEvents() {
     S.view = btn.dataset.view;
     $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
     ['relay', 'sector', 'list', 'strategy'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
-    if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); }
+    if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); loadBkKlines().catch(() => {}); requestAnimationFrame(() => requestAnimationFrame(layoutStrategyMasonry)); }
     if (S.view === 'sector') {
       if (!S.boardCurves) renderSector();
       else requestAnimationFrame(() => requestAnimationFrame(() => drawSectorChart()));
@@ -2388,6 +2410,7 @@ function bindEvents() {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       if (S.view === 'sector' && S.boardCurves) drawSectorChart();
+      if (S.view === 'strategy') layoutStrategyMasonry();
     }, 180);
   });
 }
