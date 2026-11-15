@@ -1141,7 +1141,7 @@ async function klineEm(code, period) {
 
 async function klineTx(code, period) {
   const key = (isSh(code) ? 'sh' : 'sz') + code;
-  if (period === '15' || period === '30') {
+  if (period === '1' || period === '5' || period === '15' || period === '30') {
     const url = `${API.TX_MKLINE}?param=${key},m${period},,300`;
     const j = await fetchJSON(url, 9000, 1);
     const arr = j && j.data && j.data[key] && j.data[key][`m${period}`];
@@ -1186,7 +1186,17 @@ async function intraFromTx(code) {
     bars.push({ ...b, slot: slotOf(hh * 60 + mm), t: `${s.slice(8, 10)}:${s.slice(10, 12)}` });
   }
   if (bars.length < 2) return null;
-  return { pre: bars[0].o, bars, fake: false, src: 'tx' };
+  let pre = bars[0].o;
+  try {
+    const dayBars = await klineTx(code, 'day');
+    if (dayBars && dayBars.length > 1) {
+      const dg = (x) => String(x).replace(/\D/g, '').slice(0, 8);
+      for (let i = dayBars.length - 1; i > 0; i--) {
+        if (dg(dayBars[i].t) === day) { pre = dayBars[i - 1].c; break; }
+      }
+    }
+  } catch (e) { /* keep open as base */ }
+  return { pre, bars, fake: false, src: 'tx' };
 }
 
 async function openStock(code, name) {
