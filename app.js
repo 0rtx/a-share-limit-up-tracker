@@ -1080,7 +1080,7 @@ const PERIODS = [
   { key: 'month', label: '月K' },
 ];
 const KLT = { 15: 15, 30: 30, day: 101, week: 102, month: 103 };
-const KLMT = { 15: 240, 30: 240, day: 160, week: 140, month: 72 };
+const KLMT = { 15: 240, 30: 240, day: 400, week: 140, month: 72 };
 
 function maOf(vals, n) {
   const out = new Array(vals.length).fill(null);
@@ -1166,7 +1166,7 @@ async function klineEm(code, period) {
   const secid = (isSh(code) ? '1.' : '0.') + code;
   const klt = KLT[period] || 101, lmt = KLMT[period] || 160;
   const url = `${API.EM_KLINE}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt=${klt}&fqt=1&end=20500101&lmt=${lmt}`;
-  const j = await fetchJSON(url, 9000, 1);
+  const j = await fetchJSON(url, 6000, 0);
   const k = j && j.data && j.data.klines;
   if (!k || !k.length) return null;
   return k.map((r) => {
@@ -1181,7 +1181,7 @@ async function klineTx(code, period) {
     let arr = null;
     for (const host of [API.TX_MKLINE, API.TX_MKLINE2]) {
       try {
-        const j = await fetchJSON(`${host}?param=${key},m${period},,300`, 9000, 0);
+        const j = await fetchJSON(`${host}?param=${key},m${period},,300`, 6000, 0);
         arr = j && j.data && j.data[key] && j.data[key][`m${period}`];
         if (arr && arr.length) break;
       } catch (e) { /* next host */ }
@@ -1193,7 +1193,7 @@ async function klineTx(code, period) {
   let arr = null;
   for (const host of [API.TX_KLINE, API.TX_KLINE2, API.TX_KLINE3]) {
     try {
-      const j = await fetchJSON(`${host}?param=${key},${tp},,,${KLMT[period] || 160},qfq`, 9000, 0);
+      const j = await fetchJSON(`${host}?param=${key},${tp},,,${KLMT[period] || 160},qfq`, 6000, 0);
       arr = j && j.data && j.data[key] && (j.data[key]['qfq' + tp] || j.data[key][tp]);
       if (arr && arr.length) break;
     } catch (e) { /* next host */ }
@@ -1202,11 +1202,82 @@ async function klineTx(code, period) {
   return arr.map((r) => ({ t: String(r[0]), o: +r[1], c: +r[2], h: +r[3], l: +r[4], v: +r[5] || 0 }));
 }
 
+/** 新浪日K JSONP 兜底（script 标签不走 CORS；全局串行队列，防止 window._ 互相覆盖） */
+let _sinaQ = Promise.resolve();
+function sinaDay(code) {
+  _sinaQ = _sinaQ.then(() => new Promise((res) => {
+    const key = (isSh(code) ? 'sh' : 'sz') + code;
+    try { window._ = undefined; } catch (e) {}
+    const s = document.createElement('script');
+    const to = setTimeout(() => { s.remove(); res(null); }, 12000);
+    s.onload = () => {
+      clearTimeout(to); s.remove();
+      const a = window._;
+      res(Array.isArray(a) && a.length ? a.map((d) => ({ t: d.day.replace(/-/g, ''), o: +d.open, c: +d.close, h: +d.high, l: +d.low, v: +d.volume || 0 })) : null);
+    };
+    s.onerror = () => { clearTimeout(to); s.remove(); res(null); };
+    s.src = 'https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_=/CN_MarketDataService.getKLineData?symbol=' + key + '&scale=240&ma=no&datalen=500';
+    document.head.appendChild(s);
+  }));
+  return _sinaQ;
+}
+
+/** 周key：ISO 周起始日（周一）的 YYYYMMDD */
+function weekKey(dt) {
+  const n = String(dt).replace(/\D/g, '').slice(0, 8);
+  const t = new Date(+n.slice(0, 4), +n.slice(4, 6) - 1, +n.slice(6, 8));
+  const dow = (t.getDay() + 6) % 7;
+  const m = new Date(t); m.setDate(t.getDate() - dow);
+  return '' + m.getFullYear() + String(m.getMonth() + 1).padStart(2, '0') + String(m.getDate()).padStart(2, '0');
+}
+
+/** 日K 聚合为周K/月K：开=首日开、收=末日收、高=最高、低=最低、量=求和、t=末日 */
+function aggregateBars(day, mode) {
+  if (!day || day.length < 2) return null;
+  const out = [];
+  let cur = null, curKey = null;
+  const fmt = (n) => n.slice(0, 4) + '-' + n.slice(4, 6) + '-' + n.slice(6, 8);
+  for (const b of day) {
+    const n = String(b.t).replace(/\D/g, '').slice(0, 8);
+    const y = +n.slice(0, 4), m = +n.slice(4, 6);
+    const key = mode === 'week' ? weekKey(n) : (y * 100 + m);
+    if (key !== curKey) {
+      if (cur) out.push(cur);
+      cur = { t: fmt(n), o: b.o, c: b.c, h: b.h, l: b.l, v: b.v };
+      curKey = key;
+    } else {
+      cur.c = b.c; cur.t = fmt(n);
+      if (b.h > cur.h) cur.h = b.h;
+      if (b.l < cur.l) cur.l = b.l;
+      cur.v += b.v;
+    }
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+/** 日K 三源：东财 fetch → 腾讯三主机 → 新浪 JSONP */
+async function fetchBarsDay(code) {
+  let bars = null;
+  try { bars = await klineEm(code, 'day'); } catch (e) { bars = null; }
+  if (!bars || !bars.length) {
+    try { bars = await klineTx(code, 'day'); } catch (e) { bars = null; }
+  }
+  if (!bars || !bars.length) {
+    try { bars = await sinaDay(code); } catch (e) { bars = null; }
+  }
+  return bars;
+}
+
 async function fetchBars(code, period) {
+  if (period === 'day') return fetchBarsDay(code);
   let bars = null;
   try { bars = await klineEm(code, period); } catch (e) { bars = null; }
   if (!bars || !bars.length) {
     try { bars = await klineTx(code, period); } catch (e) { bars = null; }
+  }
+  if (!bars || !bars.length) {
+    try { bars = aggregateBars(await fetchBarsDay(code), period); } catch (e) { bars = null; }
   }
   return bars;
 }
@@ -1313,7 +1384,8 @@ async function setStockPeriod(period) {
 function applyBars(bars, pre, fake) {
   const st = S.stock;
   if (!st) return;
-  st.bars = bars && bars.length ? bars : null;
+  const cap = st.period === 'intra' ? 300 : st.period === '15' || st.period === '30' ? 240 : st.period === 'day' ? 160 : st.period === 'week' ? 140 : 80;
+  st.bars = bars && bars.length ? bars.slice(-cap) : null;
   st.fake = !!(fake && st.bars);
   st.pre = pre || (st.bars && st.bars.length ? st.bars[0].o : null);
   st.ind = st.bars ? calcInd(st.bars) : null;
@@ -1938,22 +2010,46 @@ function runVolume() {
   return rows.slice(0, 10).map((x) => sh(x.code, x.name, '量比' + x.vr.toFixed(1) + ' · 今日' + fmtPct(q(x.code).chg, false)));
 }
 
+const KL_CACHE = 'klcache_v2_';
+let _klTok = 0;
 async function loadStrategyKlines() {
   if (S._klLoading || S._klReady) return;
   const codes = (S.day && S.day.recentZt || []).map((r) => r.code);
   if (!codes.length) return;
+  const tok = ++_klTok;
   S._klLoading = true;
-  S._klTotal = codes.length * 3;
+  S._klTotal = codes.length;
   S._klDone = 0;
-  for (const period of ['day', 'week', 'month']) {
-    await mapLimit(codes, 6, async (code, idx) => {
-      let bars = null;
-      try { bars = await klineTx(code, period); } catch (e) { bars = null; }
-      (S._kl[code] = S._kl[code] || {})[period] = bars;
+  S._klFail = 0;
+  const ckey = KL_CACHE + (S.day.date || '');
+  let cache = {};
+  try { cache = JSON.parse(localStorage.getItem(ckey) || '{}') || {}; } catch (e) { cache = {}; }
+  for (const c of codes) {
+    if (cache[c] && Array.isArray(cache[c].day) && cache[c].day.length) {
+      (S._kl[c] = S._kl[c] || {}).day = cache[c].day;
       S._klDone++;
-      if (idx % 30 === 0) await sleep(150);
-      if (S.view === 'strategy' && S._klDone % 15 === 0) renderStrategy();
-    });
+    }
+  }
+  if (S.view === 'strategy') renderStrategy();
+  const missing = codes.filter((c) => !((S._kl[c] || {}).day));
+  await mapLimit(missing, 5, async (code, idx) => {
+    let bars = null;
+    try { bars = await fetchBarsDay(code); } catch (e) { bars = null; }
+    if (tok !== _klTok) return;
+    (S._kl[code] = S._kl[code] || {}).day = bars;
+    if (bars && bars.length) cache[code] = { day: bars.slice(-300) };
+    else S._klFail++;
+    S._klDone++;
+    if (idx % 40 === 0) await sleep(200);
+    if (S.view === 'strategy' && S._klDone % 10 === 0) renderStrategy();
+  });
+  if (tok !== _klTok) return;
+  try { localStorage.setItem(ckey, JSON.stringify(cache)); } catch (e) { /* quota */ }
+  // 周/月由日线聚合（close 序列与真实周/月K一致，KDJ 形态等价）
+  for (const code of codes) {
+    const kl = S._kl[code] = S._kl[code] || {};
+    kl.week = aggregateBars(kl.day, 'week');
+    kl.month = aggregateBars(kl.day, 'month');
   }
   S._klLoading = false;
   S._klReady = true;
@@ -1979,7 +2075,7 @@ let _extrasDate = null;
 async function loadStrategyExtras(date) {
   if (_extrasDate === date) return;
   _extrasDate = date;
-  if (S._klDate !== date) { S._klDate = date; S._kl = {}; S._klReady = false; S._klLoading = false; }
+  if (S._klDate !== date) { S._klDate = date; S._kl = {}; S._klReady = false; S._klLoading = false; _klTok++; }
   const prevDate = S.day && S.day.prevDate;
   if (!prevDate) { _extrasDate = null; return; }
   const [prevZb, prevDt, recentZt] = await Promise.all([
@@ -2032,7 +2128,9 @@ function renderStrategy() {
             + '<span class="sh-chg ' + ccls + '">' + fmtPct(x.chg, false) + '</span>'
             + '<span class="sh-reason">' + esc(x.reason) + '</span></button>';
         }).join('')
-      : '<div class="sh-empty">' + (ready ? '今日无命中' : (st.needsKl ? 'K线计算中… ' + (S._klDone || 0) + '/' + (S._klTotal || 0) : '数据加载中…')) + '</div>';
+      : '<div class="sh-empty">' + (ready
+          ? ((st.needsKl && S._klFail >= (S._klTotal || 1) * 0.9) ? 'K线数据加载失败（' + (S._klFail || 0) + '/' + (S._klTotal || 0) + ' 只）<a class="retry">点此重试</a>' : '今日无命中')
+          : (st.needsKl ? 'K线计算中… ' + (S._klDone || 0) + '/' + (S._klTotal || 0) : '数据加载中…')) + '</div>';
     return '<div class="strategy-card">'
       + '<div class="strategy-head"><b>' + st.name + '</b><span class="strategy-tag">' + st.tag + '</span>'
       + '<span class="strategy-count">' + (ready ? hits.length + ' 只' : (st.needsKl ? '计算中' : '')) + '</span>'
@@ -2096,9 +2194,15 @@ function bindEvents() {
   });
 
   $('#strategyGrid').addEventListener('click', (e) => {
-    const el = e.target.closest('.sh');
-    if (!el) return;
-    openStock(el.dataset.code, el.querySelector('.sh-nm').textContent);
+    if (e.target.classList && e.target.classList.contains('retry')) {
+      S._klReady = false;
+      S._klLoading = false;
+      try { localStorage.removeItem(KL_CACHE + (S.day.date || '')); } catch (err) {}
+      loadStrategyKlines().catch(() => {});
+      return;
+    }
+    const btn = e.target.closest('.sh');
+    if (btn) openStock(btn.dataset.code);
   });
 
   $('#sectorList').addEventListener('click', (e) => {
