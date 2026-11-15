@@ -16,8 +16,11 @@ const API = {
   EM_QUOTE: 'https://push2.eastmoney.com/api/qt/ulist.np/get',
   EM_TREND: 'https://push2.eastmoney.com/api/qt/stock/trends2/get',
   EM_KLINE: 'https://push2his.eastmoney.com/api/qt/stock/kline/get',
-  TX_KLINE: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+  TX_KLINE: 'https://ifzq.gtimg.cn/appstock/app/fqkline/get',
+  TX_KLINE2: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get',
+  TX_KLINE3: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
   TX_MKLINE: 'https://ifzq.gtimg.cn/appstock/app/kline/mkline',
+  TX_MKLINE2: 'https://proxy.finance.qq.com/ifzqgtimg/appstock/app/kline/mkline',
 };
 const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
 
@@ -1175,16 +1178,26 @@ async function klineEm(code, period) {
 async function klineTx(code, period) {
   const key = (isSh(code) ? 'sh' : 'sz') + code;
   if (period === '1' || period === '5' || period === '15' || period === '30') {
-    const url = `${API.TX_MKLINE}?param=${key},m${period},,300`;
-    const j = await fetchJSON(url, 9000, 1);
-    const arr = j && j.data && j.data[key] && j.data[key][`m${period}`];
+    let arr = null;
+    for (const host of [API.TX_MKLINE, API.TX_MKLINE2]) {
+      try {
+        const j = await fetchJSON(`${host}?param=${key},m${period},,300`, 9000, 0);
+        arr = j && j.data && j.data[key] && j.data[key][`m${period}`];
+        if (arr && arr.length) break;
+      } catch (e) { /* next host */ }
+    }
     if (!arr || !arr.length) return null;
     return arr.map((r) => ({ t: String(r[0]), o: +r[1], c: +r[2], h: +r[3], l: +r[4], v: +r[5] || 0 }));
   }
   const tp = period === 'week' ? 'week' : period === 'month' ? 'month' : 'day';
-  const url = `${API.TX_KLINE}?param=${key},${tp},,,${KLMT[period] || 160},qfq`;
-  const j = await fetchJSON(url, 9000, 1);
-  const arr = j && j.data && j.data[key] && (j.data[key]['qfq' + tp] || j.data[key][tp]);
+  let arr = null;
+  for (const host of [API.TX_KLINE, API.TX_KLINE2, API.TX_KLINE3]) {
+    try {
+      const j = await fetchJSON(`${host}?param=${key},${tp},,,${KLMT[period] || 160},qfq`, 9000, 0);
+      arr = j && j.data && j.data[key] && (j.data[key]['qfq' + tp] || j.data[key][tp]);
+      if (arr && arr.length) break;
+    } catch (e) { /* next host */ }
+  }
   if (!arr || !arr.length) return null;
   return arr.map((r) => ({ t: String(r[0]), o: +r[1], c: +r[2], h: +r[3], l: +r[4], v: +r[5] || 0 }));
 }
@@ -1820,6 +1833,133 @@ function runOneword() {
     .map((s) => sh(s.code, s.name, '首封' + fmtTs(s.first).slice(0, 5) + ' · 换手' + pctOf(s.turnover)));
 }
 
+
+/* ---------- 指标策略（K线缓存，近5日涨停池内筛选） ---------- */
+function kdjOfBars(bars) {
+  const K = [], D = [], J = [];
+  let k = 50, d = 50;
+  for (let i = 0; i < bars.length; i++) {
+    let lo = Infinity, hi = -Infinity;
+    for (let j = Math.max(0, i - 8); j <= i; j++) { if (bars[j].l < lo) lo = bars[j].l; if (bars[j].h > hi) hi = bars[j].h; }
+    const rsv = hi === lo ? 50 : (bars[i].c - lo) / (hi - lo) * 100;
+    k = (k * 2 + rsv) / 3; d = (d * 2 + k) / 3;
+    K.push(k); D.push(d); J.push(3 * k - 2 * d);
+  }
+  return { K, D, J };
+}
+function klOf(code) { const k = S._kl && S._kl[code]; return k || null; }
+function barDay(b) { return String(b.t).replace(/\D/g, '').slice(0, 8); }
+
+/* 低位横盘：涨停后平台整理（振幅≤15%）+ 贴近60日低点 + 缩量蓄势 */
+function runSideways() {
+  const t = todayMap();
+  const rows = [];
+  for (const r of (S.day.recentZt || [])) {
+    if (t.has(r.code)) continue;
+    const k = klOf(r.code); const bars = k && k.day;
+    if (!bars || bars.length < 60) continue;
+    const dg = (b) => String(b.t).replace(/\D/g, '').slice(0, 8);
+    let idx = -1;
+    for (let i = bars.length - 1; i >= 0; i--) { if (dg(bars[i]) === r.day) { idx = i; break; } }
+    if (idx < 0) continue;
+    const seg = bars.slice(idx);
+    const lo = Math.min(...seg.map((b) => b.l));
+    const hi = Math.max(...seg.map((b) => b.h));
+    const amp = (hi - lo) / lo * 100;
+    if (amp > 15) continue;
+    const low60 = Math.min(...bars.slice(-60).map((b) => b.l));
+    const offLow = (bars[bars.length - 1].c - low60) / low60 * 100;
+    if (offLow > 20) continue;
+    const prev5 = bars.slice(-6, -1);
+    const avgV = prev5.reduce((x, b) => x + b.v, 0) / prev5.length;
+    const vr = avgV > 0 ? bars[bars.length - 1].v / avgV : 0;
+    if (vr > 2) continue;
+    rows.push({ code: r.code, name: r.name, amp, offLow, vr, n: seg.length, day: r.day });
+  }
+  rows.sort((a, b) => a.amp - b.amp);
+  return rows.slice(0, 12).map((x) => sh(x.code, x.name, x.day.slice(4, 6) + '月' + x.day.slice(6, 8) + '日涨停后' + x.n + '日整理 · 振幅' + x.amp.toFixed(1) + '% · 距60日低点' + x.offLow.toFixed(1) + '% · 量比' + x.vr.toFixed(1)));
+}
+
+function kdjHit(bars, label) {
+  if (!bars || bars.length < 16) return null;
+  const { K, D, J } = kdjOfBars(bars);
+  const n = bars.length - 1;
+  if (K[n] < D[n] || K[n - 1] >= D[n - 1]) return null;   // 本周/本月刚金叉
+  if (K[n] <= K[n - 1] || D[n] < D[n - 1]) return null;   // K、D 上翘
+  if (K[n] > 60) return null;                              // 低位区
+  if (Math.abs(K[n] - D[n]) > 8) return null;              // 金叉初期三线仍粘合
+  const pre = K.slice(n - 4, n);                           // 金叉前 K 值波动
+  if (Math.max(...pre) - Math.min(...pre) > 15) return null; // 前期粘合
+  return { k: K[n], d: D[n], j: J[n], label };
+}
+
+/* KDJ 周线上翘粘合 */
+function runKdjWeek() {
+  const rows = [];
+  for (const r of (S.day.recentZt || [])) {
+    const k = klOf(r.code);
+    const hit = kdjHit(k && k.week, '周KDJ');
+    if (hit) rows.push({ ...hit, code: r.code, name: r.name });
+  }
+  rows.sort((a, b) => a.k - b.k);
+  return rows.slice(0, 20).map((x) => sh(x.code, x.name, x.label + ' K' + x.k.toFixed(0) + ' D' + x.d.toFixed(0) + ' J' + x.j.toFixed(0) + ' · 低位金叉上翘'));
+}
+
+/* KDJ 月线上翘粘合 */
+function runKdjMonth() {
+  const rows = [];
+  for (const r of (S.day.recentZt || [])) {
+    const k = klOf(r.code);
+    const hit = kdjHit(k && k.month, '月KDJ');
+    if (hit) rows.push({ ...hit, code: r.code, name: r.name });
+  }
+  rows.sort((a, b) => a.k - b.k);
+  return rows.slice(0, 20).map((x) => sh(x.code, x.name, x.label + ' K' + x.k.toFixed(0) + ' D' + x.d.toFixed(0) + ' J' + x.j.toFixed(0) + ' · 低位金叉上翘'));
+}
+
+/* 放量启动：量比≥2.5 + 今日涨2~7% + 未涨停 */
+function runVolume() {
+  const t = todayMap();
+  const rows = [];
+  for (const r of (S.day.recentZt || [])) {
+    if (t.has(r.code)) continue;
+    const qv = q(r.code);
+    if (!qv || qv.chg == null || qv.chg < 2 || qv.chg > 7) continue;
+    const k = klOf(r.code); const bars = k && k.day;
+    if (!bars || bars.length < 6) continue;
+    if (barDay(bars[bars.length - 1]) !== S.day.date) continue;
+    const prev5 = bars.slice(-6, -1);
+    const avgV = prev5.reduce((x, b) => x + b.v, 0) / prev5.length;
+    const vr = avgV > 0 ? bars[bars.length - 1].v / avgV : 0;
+    if (vr < 2.5) continue;
+    rows.push({ code: r.code, name: r.name, vr });
+  }
+  rows.sort((a, b) => b.vr - a.vr);
+  return rows.slice(0, 10).map((x) => sh(x.code, x.name, '量比' + x.vr.toFixed(1) + ' · 今日' + fmtPct(q(x.code).chg, false)));
+}
+
+async function loadStrategyKlines() {
+  if (S._klLoading || S._klReady) return;
+  const codes = (S.day && S.day.recentZt || []).map((r) => r.code);
+  if (!codes.length) return;
+  S._klLoading = true;
+  S._klTotal = codes.length * 3;
+  S._klDone = 0;
+  for (const period of ['day', 'week', 'month']) {
+    await mapLimit(codes, 6, async (code, idx) => {
+      let bars = null;
+      try { bars = await klineTx(code, period); } catch (e) { bars = null; }
+      (S._kl[code] = S._kl[code] || {})[period] = bars;
+      S._klDone++;
+      if (idx % 30 === 0) await sleep(150);
+      if (S.view === 'strategy' && S._klDone % 15 === 0) renderStrategy();
+    });
+  }
+  S._klLoading = false;
+  S._klReady = true;
+  if (S.view === 'strategy') renderStrategy();
+}
+
 const STRATEGIES = [
   { id: 'first', name: '首板优选', tag: '打板', desc: '今日首板中封单最足、封板最早、换手健康的前 10 只', run: runFirst },
   { id: 'promote', name: '一进二晋级', tag: '打板', desc: '昨日首板、今日再度封板，短线最经典的打板晋级', run: runPromote },
@@ -1827,6 +1967,10 @@ const STRATEGIES = [
   { id: 'reseal', name: '炸板回封', tag: '打板', desc: '今日盘中开过板、尾盘仍封住涨停，分歧转一致', run: runReseal },
   { id: 'reversal', name: '涨停反包', tag: '反包', desc: '昨日炸板、今日直接涨停反包，弱转强信号', run: runReversal },
   { id: 'pullback', name: '龙回头低吸', tag: '低吸', desc: '近 5 日曾涨停、今日未涨停但温和放量上涨，强势股资金回流', run: runPullback },
+  { id: 'sideways', name: '低位横盘', tag: '指标', desc: '涨停后平台整理（振幅≤15%）、贴近60日低点、缩量蓄势（近5日涨停池内筛选，前复权）', needsKl: true, run: runSideways },
+  { id: 'kdjw', name: 'KDJ周线上翘', tag: '指标', desc: '周线KDJ(9,3,3)三线低位粘合、K上穿D后继续上翘（近5日涨停池内筛选，显示前20只）', needsKl: true, run: runKdjWeek },
+  { id: 'kdjm', name: 'KDJ月线上翘', tag: '指标', desc: '月线KDJ(9,3,3)三线低位粘合、K上穿D后继续上翘（近5日涨停池内筛选，显示前20只）', needsKl: true, run: runKdjMonth },
+  { id: 'volume', name: '放量启动', tag: '指标', desc: '量比≥2.5、今日涨2~7%且未涨停，资金进场信号（近5日涨停池内筛选）', needsKl: true, run: runVolume },
   { id: 'dtd', name: '地天板', tag: '反包', desc: '昨日跌停、今日涨停的极端反转，辨识度极高', run: runDtd },
   { id: 'oneword', name: '一字加速', tag: '情绪', desc: '开盘即封死、几乎无换手的一字板，资金一致性最强', run: runOneword },
 ];
@@ -1835,6 +1979,7 @@ let _extrasDate = null;
 async function loadStrategyExtras(date) {
   if (_extrasDate === date) return;
   _extrasDate = date;
+  if (S._klDate !== date) { S._klDate = date; S._kl = {}; S._klReady = false; S._klLoading = false; }
   const prevDate = S.day && S.day.prevDate;
   if (!prevDate) { _extrasDate = null; return; }
   const [prevZb, prevDt, recentZt] = await Promise.all([
@@ -1852,7 +1997,7 @@ async function loadStrategyExtras(date) {
     for (const [k, v] of extra) S.quotes.set(k, v);
     if (!S.day || S.day.date !== date) return;
   }
-  if (S.view === 'strategy') renderStrategy();
+  if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); }
 }
 
 async function fetchRecentZt(endDate, days) {
@@ -1871,9 +2016,10 @@ function renderStrategy() {
   const grid = $('#strategyGrid');
   if (!grid) return;
   if (!S.day) { grid.innerHTML = ''; return; }
-  const ready = !!(S.day.prevZb && S.day.prevDt && S.day.recentZt);
+  const readyBase = !!(S.day.prevZb && S.day.prevDt && S.day.recentZt);
   grid.innerHTML = STRATEGIES.map((st) => {
     let hits = [];
+    const ready = st.needsKl ? readyBase && !!S._klReady : readyBase;
     if (ready) {
       try { hits = st.run() || []; } catch (e) { console.error(st.id, e); }
     }
@@ -1886,10 +2032,10 @@ function renderStrategy() {
             + '<span class="sh-chg ' + ccls + '">' + fmtPct(x.chg, false) + '</span>'
             + '<span class="sh-reason">' + esc(x.reason) + '</span></button>';
         }).join('')
-      : '<div class="sh-empty">' + (ready ? '今日无命中' : '数据加载中…') + '</div>';
+      : '<div class="sh-empty">' + (ready ? '今日无命中' : (st.needsKl ? 'K线计算中… ' + (S._klDone || 0) + '/' + (S._klTotal || 0) : '数据加载中…')) + '</div>';
     return '<div class="strategy-card">'
       + '<div class="strategy-head"><b>' + st.name + '</b><span class="strategy-tag">' + st.tag + '</span>'
-      + '<span class="strategy-count">' + (ready ? hits.length + ' 只' : '') + '</span>'
+      + '<span class="strategy-count">' + (ready ? hits.length + ' 只' : (st.needsKl ? '计算中' : '')) + '</span>'
       + '<p class="strategy-desc">' + st.desc + '</p></div>'
       + '<div class="strategy-hits">' + cells + '</div></div>';
   }).join('');
@@ -1903,7 +2049,7 @@ function bindEvents() {
     S.view = btn.dataset.view;
     $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
     ['relay', 'sector', 'list', 'strategy'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
-    if (S.view === 'strategy') renderStrategy();
+    if (S.view === 'strategy') { renderStrategy(); loadStrategyKlines().catch(() => {}); }
     if (S.view === 'sector') {
       if (!S.boardCurves) renderSector();
       else requestAnimationFrame(() => requestAnimationFrame(() => drawSectorChart()));
