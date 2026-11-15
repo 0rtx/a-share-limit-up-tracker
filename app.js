@@ -332,6 +332,7 @@ async function loadDay(date, opts = {}) {
 
     S.quotes = quotes;
     S.day = { zt, zb, dt, prev: prevInfo.pool, prevDate: prevInfo.date, blocks };
+    S._lv = null;
 
     // 代码 -> 所属板块
     const meta = new Map();
@@ -386,6 +387,19 @@ function toast(msg) {
 
 /* ---------------------------- derived ---------------------------- */
 function todayMap() { return new Map(S.day.zt.map((s) => [s.code, s])); }
+// 今日真实连板数：昨日也涨停则 +1，否则按首板（同花顺 high_days 是「N天M板」，非严格连续）
+function todayLevels() {
+  if (S._lv) return S._lv;
+  const pm = new Map((S.day.prev || []).map((x) => [x.code, x]));
+  const m = new Map();
+  for (const s of S.day.zt) {
+    const p = pm.get(s.code);
+    m.set(s.code, p ? (p.level || 1) + 1 : 1);
+  }
+  S._lv = m;
+  return m;
+}
+function lvOf(code) { return todayLevels().get(code) || 1; }
 function zbMap() { return new Map(S.day.zb.map((s) => [s.code, s])); }
 function q(code) { return S.quotes.get(code) || null; }
 function chgOf(code, fallback) {
@@ -402,7 +416,7 @@ function blockTags(code, limit = 1) {
 }
 function maxLevel() {
   let m = 1;
-  for (const s of S.day.zt) m = Math.max(m, s.level || 1);
+  for (const s of S.day.zt) m = Math.max(m, lvOf(s.code));
   return m;
 }
 
@@ -522,7 +536,7 @@ function renderLadder() {
   }
 
   // 首板行 = 今日首板
-  let first = zt.filter((s) => (s.level || 1) === 1);
+  let first = zt.filter((s) => lvOf(s.code) === 1);
   if (chipSet) first = first.filter((s) => chipSet.has(s.code));
   if (first.length) {
     const items = buildItems(first.map((s) => s.code), new Map(first.map((s) => [s.code, s])));
@@ -922,7 +936,7 @@ const TABLE_COLS = {
     { t: '名称', v: (s) => `<span class="name" data-code="${s.code}">${esc(s.name)}</span>` },
     { t: '最新价', v: (s) => s.price != null ? s.price.toFixed(2) : '—' },
     { t: '涨跌幅', cls: 'chg', v: (s) => fmtPct(s.chg) },
-    { t: '连板', v: (s) => `<span class="tag">${s.level === 1 ? '首板' : s.level + '板'}</span>` },
+    { t: '连板', v: (s) => `<span class="tag">${lvOf(s.code) === 1 ? '首板' : lvOf(s.code) + '板'}</span>` },
     { t: '涨停统计', v: (s) => `<span class="tag g">${esc(s.daysText || '—')}</span>` },
     { t: '板块概念', cls: 'tags-cell', v: (s) => tagsHtml(s.code) },
     { t: '首封', v: (s) => fmtTs(s.first) },
@@ -973,7 +987,7 @@ function currentRows() {
   if (tab === 'zt') {
     if (S.level) {
       const lv = +S.level;
-      rows = rows.filter((s) => (lv >= 6 ? (s.level || 1) >= 6 : (s.level || 1) === lv));
+      rows = rows.filter((s) => (lv >= 6 ? lvOf(s.code) >= 6 : lvOf(s.code) === lv));
     }
   }
   const kw = S.search.trim().toLowerCase();
