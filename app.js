@@ -15,8 +15,8 @@ const API = {
   EM_POOL: 'https://push2ex.eastmoney.com/',
   EM_QUOTE: 'https://push2.eastmoney.com/api/qt/ulist.np/get',
   EM_TREND: 'https://push2.eastmoney.com/api/qt/stock/trends2/get',
-  TX_MIN: 'https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=',
-  TX_K: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=',
+  EM_KLINE: 'https://push2his.eastmoney.com/api/qt/stock/kline/get',
+  TX_KLINE: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
 };
 const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
 
@@ -87,14 +87,19 @@ function mkName(code) {
 }
 function marketOf(code) { return isSh(code) ? '1' : '0'; }
 
-async function fetchJSON(url, timeout = 12000) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeout);
-  try {
-    const r = await fetch(url, { signal: ctl.signal, cache: 'no-store' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return await r.json();
-  } finally { clearTimeout(t); }
+async function fetchJSON(url, timeout = 12000, retries = 0) {
+  for (let i = 0; i <= retries; i++) {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeout);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } catch (e) {
+      if (i === retries) throw e;
+      await sleep(1500 * (i + 1));
+    } finally { clearTimeout(t); }
+  }
 }
 
 function jsonp(url, cbParam = 'cb', timeout = 12000) {
@@ -160,6 +165,7 @@ function normThs(x) {
     reason: x.reason_type || '',
     flowCap: x.currency_value,
     tag: x.change_tag || '',
+    tp: Array.isArray(x.time_preview) ? x.time_preview : null,
   };
 }
 
@@ -251,19 +257,19 @@ async function fetchQuotes(codes) {
 }
 
 async function fetchMinute(code) {
-  const sym = (isSh(code) ? 'sh' : 'sz') + code;
-  const j = await fetchJSON(API.TX_MIN + sym, 10000);
-  const d = j && j.data && j.data[sym];
-  if (!d || !d.data || !d.data.data) return null;
-  const qt = d.qt && d.qt[sym];
-  const pre = qt ? +qt[4] : 0;
+  const secid = (isSh(code) ? '1.' : '0.') + code;
+  const url = `${API.EM_TREND}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1`;
+  const j = await fetchJSON(url, 10000, 1);
+  const d = j && j.data;
+  if (!d || !d.trends) return null;
+  const pre = +d.preClose || 0;
   const pts = [];
-  for (const row of d.data.data) {
-    const seg = row.split(' ');
-    const t = seg[0];
-    if (t.length < 4) continue;
-    const hh = +t.slice(0, 2), mm = +t.slice(2, 4);
-    const p = +seg[1];
+  for (const row of d.trends) {
+    const seg = row.split(',');
+    const hm = seg[0].split(' ')[1];
+    if (!hm) continue;
+    const hh = +hm.slice(0, 2), mm = +hm.slice(3, 5);
+    const p = +seg[2];
     if (!p) continue;
     pts.push([slotOf(hh * 60 + mm), p]);
   }
@@ -576,11 +582,13 @@ function rowHtml(key, num, pct, items) {
 }
 
 /* ---------------------------- sector ---------------------------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 async function ensureMinutes(codes) {
   const need = codes.filter((c) => !S.minute.has(c) && !S.minutePending.has(c));
   if (!need.length) return;
   need.forEach((c) => S.minutePending.add(c));
-  await mapLimit(need, 8, async (code) => {
+  await mapLimit(need, 3, async (code) => {
     try {
       const m = await fetchMinute(code);
       if (m) S.minute.set(code, m);
@@ -589,36 +597,38 @@ async function ensureMinutes(codes) {
   });
 }
 
+/* time_preview: 80 个 3 分钟涨跌幅采样（0..40=09:30-11:30，41..79=13:00-14:54）-> 图表 slot */
+function tpSlot(i) {
+  const s = i <= 40 ? 3 * i : 121 + 3 * (i - 41);
+  return s > 241 ? 241 : s;
+}
+
 async function buildBoardCurves() {
   const sel = S.day.blocks.filter((b) => S.boardSel.has(b.name));
   if (!sel.length) return [];
-  const codes = Array.from(new Set(sel.flatMap((b) => b.stocks.map((s) => s.code))));
-  await ensureMinutes(codes);
+  const pmap = new Map((S.day.zt || []).map((s) => [s.code, s]));
 
   return sel.map((b) => {
-    const pts = b.stocks.map((s) => {
-      const m = S.minute.get(s.code);
-      if (!m || !m.pre) return null;
-      return { m, first: s.first || 0 };
-    }).filter(Boolean);
-    if (!pts.length) return { name: b.name, values: [], ztCount: b.zt };
-    const arrs = pts.map((p) => {
+    const arrs = b.stocks.map((s) => {
+      const pr = pmap.get(s.code);
+      if (!pr || !pr.tp || !pr.tp.length) return null;
       const a = new Array(242).fill(null);
-      for (const [slot, v] of p.m.pts) a[slot] = v;
+      pr.tp.forEach((v, i) => { a[tpSlot(i)] = v; });
       let zslot = 999;
-      if (p.first) {
-        const d = new Date(+p.first * 1000 + 8 * 3600 * 1000);
+      if (pr.first) {
+        const d = new Date(+pr.first * 1000 + 8 * 3600 * 1000);
         zslot = slotOf(d.getUTCHours() * 60 + d.getUTCMinutes());
       }
-      return { a, pre: p.m.pre, zslot };
-    });
+      return { a, zslot };
+    }).filter(Boolean);
+    if (!arrs.length) return { name: b.name, values: [], ztCount: b.zt };
     const values = [];
     const ztSeries = [];
     for (let slot = 0; slot <= 241; slot++) {
       let sum = 0, n = 0, zc = 0;
       for (const p of arrs) {
         const v = p.a[slot];
-        if (v != null) { sum += (v - p.pre) / p.pre * 100; n++; }
+        if (v != null) { sum += v; n++; }
         if (p.zslot <= slot) zc++;
       }
       values.push(n ? sum / n : null);
@@ -658,7 +668,7 @@ async function renderSector() {
 
 function updateSectorHint() {
   const txt = {
-    chg: '成员股等权涨幅 · 分钟级',
+    chg: '成员股等权涨幅 · 3分钟级',
     strength: '强度 = 涨停家数 × 100 + 涨幅 × 10',
     zt: '按首封时间累计的涨停家数',
   }[S.boardMode] || '';
@@ -939,13 +949,6 @@ const TABLE_COLS = {
     { t: '连板', v: (s) => `<span class="tag">${lvOf(s.code) === 1 ? '首板' : lvOf(s.code) + '板'}</span>` },
     { t: '涨停统计', v: (s) => `<span class="tag g">${esc(s.daysText || '—')}</span>` },
     { t: '板块概念', cls: 'tags-cell', v: (s) => tagsHtml(s.code) },
-    { t: '首封', v: (s) => fmtTs(s.first) },
-    { t: '最后封板', v: (s) => fmtTs(s.last) },
-    { t: '炸板', v: (s) => s.openNum || 0 },
-    { t: '封单额', v: (s) => fmtAmt(s.orderAmt) },
-    { t: '换手', v: (s) => pctOf(q(s.code)?.turnover ?? s.turnover) },
-    { t: '成交额', v: (s) => fmtAmt(q(s.code)?.amt ?? s.amount) },
-    { t: '流通市值', v: (s) => fmtAmt(q(s.code)?.flowCap ?? s.flowCap) },
   ],
   zb: [
     { t: '#', v: (s, i) => i + 1 },
@@ -1032,16 +1035,16 @@ function renderList() {
 async function openStock(code, name) {
   $('#modalTitle').innerHTML = `${esc(name || code)}<span class="sub">${code}</span>`;
   $('#modal').classList.add('on');
-  try {
-    if (!S.minute.has(code)) {
-      const m = await fetchMinute(code);
-      if (m) S.minute.set(code, m);
-    }
-    drawIntra(code);
-    await drawKline(code);
-  } catch (e) {
-    console.error(e);
+  if (!S.minute.has(code)) {
+    const row = (S.day.zt || []).find((s) => s.code === code);
+    if (row && row.tp) S.minute.set(code, { pre: 100, pts: row.tp.map((v, i) => [tpSlot(i), 100 + v]) });
   }
+  drawIntra(code);
+  try {
+    const m = await fetchMinute(code);
+    if (m) { S.minute.set(code, m); drawIntra(code); }
+  } catch (e) { /* keep tp fallback */ }
+  try { await drawKline(code); } catch (e) { console.error(e); }
 }
 
 function drawIntra(code) {
@@ -1067,13 +1070,35 @@ function drawIntra(code) {
   });
 }
 
+async function klineEm(code) {
+  const secid = (isSh(code) ? '1.' : '0.') + code;
+  const url = `${API.EM_KLINE}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=60`;
+  const j = await fetchJSON(url, 10000, 1);
+  const k = j && j.data && j.data.klines;
+  if (!k || !k.length) return null;
+  return k.map((r) => {
+    const c = r.split(',');
+    return { date: c[0], open: +c[1], close: +c[2], high: +c[3], low: +c[4] };
+  });
+}
+
+async function klineTx(code) {
+  const key = (isSh(code) ? 'sh' : 'sz') + code;
+  const url = `${API.TX_KLINE}?param=${key},day,,,60,qfq`;
+  const j = await fetchJSON(url, 10000, 1);
+  const day = j && j.data && j.data[key] && (j.data[key].qfqday || j.data[key].day);
+  if (!day || !day.length) return null;
+  return day.map((r) => ({ date: r[0], open: +r[1], close: +r[2], high: +r[3], low: +r[4] }));
+}
+
 async function drawKline(code) {
-  const sym = (isSh(code) ? 'sh' : 'sz') + code;
-  const j = await fetchJSON(API.TX_K + `${sym},day,,,60,qfq`, 12000);
-  const d = j && j.data && j.data[sym];
-  const k = d && (d.qfqday || d.day);
+  let rows = null;
+  try { rows = await klineEm(code); } catch (e) { rows = null; }
+  if (!rows || !rows.length) {
+    try { rows = await klineTx(code); } catch (e) { rows = null; }
+  }
   const canvas = $('#chartKline');
-  if (!k || !k.length) {
+  if (!rows || !rows.length) {
     const ctx = canvas.getContext('2d');
     canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -1081,7 +1106,6 @@ async function drawKline(code) {
     ctx.fillText('暂无 K 线数据', canvas.clientWidth / 2, canvas.clientHeight / 2);
     return;
   }
-  const rows = k.map((r) => ({ date: r[0], open: +r[1], close: +r[2], high: +r[3], low: +r[4] }));
   const vals = rows.map((r) => r.close);
   drawLineChart(canvas, {
     series: [{ name: '收盘', color: '#2563eb', vals }],
