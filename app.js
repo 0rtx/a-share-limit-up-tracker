@@ -569,6 +569,24 @@ function renderLadder() {
 
   $('#ladder').innerHTML = rows.join('') || `<div class="empty">${S.promoteOnly ? '今日没有晋级成功的股票' : '该板块今日无涨停'}</div>`;
   $('#ladder').classList.toggle('focusing', !!S.focusSec);
+  const bar = $('#focusBar');
+  if (bar) {
+    if (S.focusSec) {
+      const n = $('#ladder').querySelectorAll('.stk.focus').length;
+      bar.innerHTML = `<b>已高亮</b><i>${esc(S.focusSec)}</i><span>${n} 只</span><em>点击空白处取消</em><button class="fb-x" type="button">取消</button>`;
+      bar.classList.remove('hidden');
+    } else {
+      bar.classList.add('hidden');
+      bar.innerHTML = '';
+    }
+  }
+}
+
+function clearFocusSec() {
+  if (!S.focusSec) return false;
+  S.focusSec = null;
+  renderLadder();
+  return true;
 }
 
 function memberSet(name) {
@@ -2322,13 +2340,28 @@ function bindEvents() {
   $('#ladder').addEventListener('click', (e) => {
     const sec = e.target.closest('.sec[data-sec]');
     if (sec) {
+      // 重渲染会移除被点的元素，阻止冒泡以免 document 兜底逻辑误判为「点空白」
+      e.stopPropagation();
       const nm = sec.dataset.sec;
       S.focusSec = S.focusSec === nm ? null : nm;
       renderLadder();
       return;
     }
     const el = e.target.closest('.stk');
-    if (el) openStock(el.dataset.code, el.querySelector('.nm').textContent);
+    if (el) {
+      clearFocusSec();
+      openStock(el.dataset.code, el.querySelector('.nm').textContent);
+      return;
+    }
+    clearFocusSec();
+  });
+
+  $('#focusBar').addEventListener('click', clearFocusSec);
+
+  document.addEventListener('click', (e) => {
+    if (!S.focusSec) return;
+    if (e.target.closest('#ladder') || e.target.closest('#focusBar')) return;
+    clearFocusSec();
   });
 
   $('#sectorMode').addEventListener('click', (e) => {

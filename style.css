@@ -265,6 +265,20 @@ input[type=date] {
 .stk .sec.hl[data-sec] { background: #e6efff; border-color: #c9dbff; font-weight: 600; }
 .stk.focus { background: #eef4ff; border-radius: 8px; box-shadow: inset 0 0 0 1px #cfe0ff; }
 .ladder.focusing .stk:not(.focus) { opacity: .38; }
+.focus-bar {
+  display: flex; align-items: center; gap: 8px; margin: 0 16px 8px; padding: 7px 10px;
+  font-size: 12.5px; color: #33415c; background: #f2f7ff; border: 1px solid #d8e6ff; border-radius: 8px;
+}
+.focus-bar.hidden { display: none; }
+.focus-bar b { font-weight: 600; color: var(--accent); }
+.focus-bar i { font-style: normal; font-weight: 600; }
+.focus-bar span { color: var(--muted); }
+.focus-bar em { font-style: normal; color: var(--muted); margin-left: auto; font-size: 11.5px; }
+.focus-bar .fb-x {
+  border: 1px solid #d8e6ff; background: #fff; color: #5b6577; font-size: 11.5px;
+  border-radius: 6px; padding: 2px 8px; cursor: pointer;
+}
+.focus-bar .fb-x:hover { border-color: #c9dbff; color: var(--accent); }
 
 /* ---------- sector ---------- */
 .sector-head {
