@@ -257,6 +257,14 @@ input[type=date] {
   max-width: 76px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .stk .sec.hl { color: var(--accent); }
+.stk .sec[data-sec] {
+  cursor: pointer; border-radius: 5px; padding: 0 5px; margin-left: -3px;
+  border: 1px solid transparent; transition: background .15s, border-color .15s, color .15s;
+}
+.stk .sec[data-sec]:hover { color: var(--accent); background: #f3f7ff; border-color: #c9dbff; }
+.stk .sec.hl[data-sec] { background: #e6efff; border-color: #c9dbff; font-weight: 600; }
+.stk.focus { background: #eef4ff; border-radius: 8px; box-shadow: inset 0 0 0 1px #cfe0ff; }
+.ladder.focusing .stk:not(.focus) { opacity: .38; }
 
 /* ---------- sector ---------- */
 .sector-head {

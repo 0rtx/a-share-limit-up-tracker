@@ -32,6 +32,7 @@ const S = {
   rule: 'hot',
   chip: null,
   promoteOnly: false,  // 只看晋级成功
+  focusSec: null,      // 高亮的板块/概念名
   tab: 'zt',
   search: '',
   level: '',
@@ -347,6 +348,7 @@ async function loadDay(date, opts = {}) {
     S.quotes = quotes;
     S.day = { date: useDate, zt, zb, dt, prev: prevInfo.pool, prevDate: prevInfo.date, blocks };
     S._lv = null;
+    S.focusSec = null;
 
     // 代码 -> 所属板块
     const meta = new Map();
@@ -566,6 +568,7 @@ function renderLadder() {
   }
 
   $('#ladder').innerHTML = rows.join('') || `<div class="empty">${S.promoteOnly ? '今日没有晋级成功的股票' : '该板块今日无涨停'}</div>`;
+  $('#ladder').classList.toggle('focusing', !!S.focusSec);
 }
 
 function memberSet(name) {
@@ -575,17 +578,23 @@ function memberSet(name) {
 
 function rowHtml(key, num, pct, items) {
   const cls = pct >= 50 ? 'up' : '';
+  const focus = S.focusSec || null;
   const cells = items.map((it) => {
-    const tags = blockTags(it.code, 1);
+    const tags = blockTags(it.code, 8);
     const tag = tags[0] || '';
     const chgCls = it.chg == null ? 'flat' : it.chg > 0 ? 'up' : it.chg < 0 ? 'down' : 'flat';
     const label = it.status === 'up' ? '成' : it.status === 'boom' ? '炸' : '败';
-    return `<span class="stk st ${it.status}" data-code="${it.code}" title="${esc(it.name)} ${it.level ? it.level + '板' : ''}">
+    const hit = !!focus && (tag === focus || tags.indexOf(focus) >= 0);
+    const tagOn = focus ? tag === focus : !!(S.chip && tag === S.chip);
+    const tagHtml = tag
+      ? `<i class="sec${tagOn ? ' hl' : ''}" data-sec="${esc(tag)}" title="点击高亮同板块股票">${esc(tag)}</i>`
+      : '<i class="sec"></i>';
+    return `<span class="stk st ${it.status}${hit ? ' focus' : ''}" data-code="${it.code}" title="${esc(it.name)} ${it.level ? it.level + '板' : ''}">
       <i class="mk">${mkName(it.code)}</i>
       <em class="nm">${esc(it.name)}</em>
       <i class="st">${label}</i>
       <b class="chg ${chgCls}">${it.chg == null ? '—' : fmtPct(it.chg, false)}</b>
-      <i class="sec ${S.chip && tag === S.chip ? 'hl' : ''}">${esc(tag)}</i>
+      ${tagHtml}
     </span>`;
   }).join('');
   return `<div class="lrow">
@@ -2311,6 +2320,13 @@ function bindEvents() {
   });
 
   $('#ladder').addEventListener('click', (e) => {
+    const sec = e.target.closest('.sec[data-sec]');
+    if (sec) {
+      const nm = sec.dataset.sec;
+      S.focusSec = S.focusSec === nm ? null : nm;
+      renderLadder();
+      return;
+    }
     const el = e.target.closest('.stk');
     if (el) openStock(el.dataset.code, el.querySelector('.nm').textContent);
   });
