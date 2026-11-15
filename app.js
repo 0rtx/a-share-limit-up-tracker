@@ -1115,7 +1115,7 @@ function fmtBarT(t, period) {
   const s = String(t);
   if (/^\d{12}$/.test(s)) return `${s.slice(4, 6)}-${s.slice(6, 8)} ${s.slice(8, 10)}:${s.slice(10, 12)}`;
   if (s.length >= 16) return s.slice(5, 16);
-  if (s.length >= 10) return s.slice(5, 10);
+  if (s.length >= 10) return period === 'month' ? s.slice(0, 7) : s.slice(5, 10);
   return s;
 }
 
@@ -1381,14 +1381,19 @@ function drawStockChart() {
     const last = bars[n - 1].c, first = st.pre || bars[0].o;
     const lineColor = last >= first ? C_UP : C_DN;
     const grad = ctx.createLinearGradient(0, pTop, 0, pTop + priceH);
-    grad.addColorStop(0, lineColor + '33');
-    grad.addColorStop(1, lineColor + '05');
+    grad.addColorStop(0, lineColor + '1f');
+    grad.addColorStop(1, lineColor + '03');
     const area = new Path2D(path);
     area.lineTo(X(n - 1), pTop + priceH);
     area.lineTo(X(0), pTop + priceH);
     area.closePath();
     ctx.fillStyle = grad; ctx.fill(area);
     ctx.strokeStyle = lineColor; ctx.lineWidth = 1.4; ctx.stroke(path);
+    // pre-close base line on top of the fill
+    const y0 = pTop + priceH / 2;
+    ctx.strokeStyle = '#c9d3e2'; ctx.setLineDash([4, 4]); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(padL, y0); ctx.lineTo(padL + iw, y0); ctx.stroke();
+    ctx.setLineDash([]);
     // avg line
     const avg = bars.map((b) => b.avg).filter((v) => v != null);
     if (avg.length === bars.length) {
@@ -1549,20 +1554,25 @@ function drawStockChart() {
   ctx.fillText('RSI(6,12,24)', padL + 2, rTop + 9);
 
   /* ---- x labels ---- */
-  ctx.textAlign = 'center'; ctx.fillStyle = C_TXT;
+  ctx.fillStyle = C_TXT;
   if (isIntra) {
     const xs = [[0, '09:30'], [60, '10:30'], [120, '11:30/13:00'], [181, '14:00'], [241, '15:00']];
-    for (const [slot, lab] of xs) {
+    xs.forEach(([slot, lab], i) => {
       const x = padL + (slot / 241) * iw;
+      ctx.textAlign = i === 0 ? 'left' : i === xs.length - 1 ? 'right' : 'center';
       ctx.fillText(lab, x, H - 6);
-    }
+    });
   } else {
     const picks = Math.min(5, n);
-    for (let g = 0; g < picks; g++) {
-      const i = Math.round((n - 1) * (g / Math.max(1, picks - 1)));
-      ctx.fillText(fmtBarT(bars[i].t, st.period), X(i), H - 6);
-    }
+    const idxs = [];
+    for (let g = 0; g < picks; g++) idxs.push(Math.round((n - 1) * (g / Math.max(1, picks - 1))));
+    idxs.forEach((i, g) => {
+      const x = X(i);
+      ctx.textAlign = g === 0 ? 'left' : g === idxs.length - 1 ? 'right' : 'center';
+      ctx.fillText(fmtBarT(bars[i].t, st.period), Math.max(padL, Math.min(padL + iw, x)), H - 6);
+    });
   }
+  ctx.textAlign = 'center';
 
   /* ---- crosshair ---- */
   if (st.hover != null && st.hover >= 0 && st.hover < n) {
