@@ -41,6 +41,7 @@ const S = {
   minute: new Map(),  // code -> {pre, bars, fake}
   minutePending: new Set(),
   blockMeta: new Map(), // code -> [blockName]
+  reasonMap: new Map(), // code -> [涨停原因里的题材标签]
   autoTimer: null,
   loading: false,
   boardMode: 'chg',
@@ -361,6 +362,32 @@ async function loadDay(date, opts = {}) {
     }
     S.blockMeta = meta;
 
+    // 代码 -> 涨停原因里的题材标签（覆盖今日涨停/炸板/跌停/昨日涨停，兜底无板块归属的股票）
+    const blockNames = new Set(blocks.map((b) => b.name));
+    for (const arr2 of meta.values()) for (const n of arr2) blockNames.add(n);
+    const canonTag = (t) => {
+      if (blockNames.has(t)) return t;
+      let best = null;
+      for (const n of blockNames) {
+        if (n.length <= t.length || n.indexOf(t) < 0) continue;
+        if (!best || n.length < best.length) best = n;
+      }
+      return best || t;
+    };
+    const reasonMap = new Map();
+    for (const arr2 of [zt, zb, dt, prevInfo.pool]) {
+      for (const s of arr2) {
+        if (!s || !s.reason || reasonMap.has(s.code)) continue;
+        const raw = String(s.reason).split('+').map((t) => t.replace(/[“”"]/g, '').trim()).filter(Boolean);
+        const canon = raw.map(canonTag);
+        // 能对应到真实板块名的标签优先（点它能联动到同板块其它股票）
+        const order = raw.map((t, i) => i).sort((a, b) => (canon[a] === raw[a] ? 1 : 0) - (canon[b] === raw[b] ? 1 : 0));
+        const tags = order.map((i) => canon[i]).filter((t, i, a) => t && a.indexOf(t) === i);
+        if (tags.length) reasonMap.set(s.code, tags);
+      }
+    }
+    S.reasonMap = reasonMap;
+
     S.minute.clear();
     S.boardCurves = null;
     if (!S.boardSel.size) {
@@ -427,6 +454,8 @@ function chgOf(code, fallback) {
 function blockTags(code, limit = 1) {
   const arr = S.blockMeta.get(code);
   if (arr && arr.length) return arr.slice(0, limit);
+  const r = S.reasonMap.get(code);
+  if (r && r.length) return r.slice(0, limit);
   const s = todayMap().get(code);
   if (s && s.reason) return s.reason.split('+').slice(0, limit);
   return [];
@@ -605,7 +634,7 @@ function rowHtml(key, num, pct, items) {
     const hit = !!focus && (tag === focus || tags.indexOf(focus) >= 0);
     const tagOn = focus ? tag === focus : !!(S.chip && tag === S.chip);
     const tagHtml = tag
-      ? `<i class="sec${tagOn ? ' hl' : ''}" data-sec="${esc(tag)}" title="点击高亮同板块股票">${esc(tag)}</i>`
+      ? `<i class="sec${tagOn ? ' hl' : ''}" data-sec="${esc(tag)}" title="${esc(tag)} · 点击高亮同板块股票">${esc(tag)}</i>`
       : '<i class="sec"></i>';
     return `<span class="stk st ${it.status}${hit ? ' focus' : ''}" data-code="${it.code}" title="${esc(it.name)} ${it.level ? it.level + '板' : ''}">
       <i class="mk">${mkName(it.code)}</i>
