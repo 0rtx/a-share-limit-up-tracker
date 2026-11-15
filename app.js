@@ -17,6 +17,7 @@ const API = {
   EM_TREND: 'https://push2.eastmoney.com/api/qt/stock/trends2/get',
   EM_KLINE: 'https://push2his.eastmoney.com/api/qt/stock/kline/get',
   TX_KLINE: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get',
+  TX_MKLINE: 'https://ifzq.gtimg.cn/appstock/app/kline/mkline',
 };
 const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
 
@@ -31,7 +32,7 @@ const S = {
   level: '',
   day: null,          // {zt, zb, dt, prev, blocks, quotes, prevDate}
   quotes: new Map(),  // code -> {chg, price, amt, turnover, flowCap, mainIn}
-  minute: new Map(),  // code -> {pre, pts}
+  minute: new Map(),  // code -> {pre, bars, fake}
   minutePending: new Set(),
   blockMeta: new Map(), // code -> [blockName]
   autoTimer: null,
@@ -87,7 +88,7 @@ function mkName(code) {
 }
 function marketOf(code) { return isSh(code) ? '1' : '0'; }
 
-async function fetchJSON(url, timeout = 12000, retries = 0) {
+async function fetchJSON(url, timeout = 12000, retries = 0, gap = 1500) {
   for (let i = 0; i <= retries; i++) {
     const ctl = new AbortController();
     const t = setTimeout(() => ctl.abort(), timeout);
@@ -97,7 +98,7 @@ async function fetchJSON(url, timeout = 12000, retries = 0) {
       return await r.json();
     } catch (e) {
       if (i === retries) throw e;
-      await sleep(1500 * (i + 1));
+      await sleep(gap * (i + 1));
     } finally { clearTimeout(t); }
   }
 }
@@ -258,22 +259,24 @@ async function fetchQuotes(codes) {
 
 async function fetchMinute(code) {
   const secid = (isSh(code) ? '1.' : '0.') + code;
-  const url = `${API.EM_TREND}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1`;
-  const j = await fetchJSON(url, 10000, 1);
+  const url = `${API.EM_TREND}?ut=${API.EM_UT}&secid=${secid}&fields1=f1,f2,f3,f4,f5,f6,f7,f8&fields2=f51,f52,f53,f54,f55,f56,f57,f58&iscr=0&ndays=1`;
+  const j = await fetchJSON(url, 10000, 2);
   const d = j && j.data;
-  if (!d || !d.trends) return null;
+  if (!d || !Array.isArray(d.trends) || !d.trends.length) return null;
   const pre = +d.preClose || 0;
-  const pts = [];
+  const bars = [];
   for (const row of d.trends) {
     const seg = row.split(',');
-    const hm = seg[0].split(' ')[1];
+    const hm = (seg[0] || '').split(' ')[1];
     if (!hm) continue;
     const hh = +hm.slice(0, 2), mm = +hm.slice(3, 5);
-    const p = +seg[2];
-    if (!p) continue;
-    pts.push([slotOf(hh * 60 + mm), p]);
+    const c = +seg[2];
+    if (!c) continue;
+    const slot = slotOf(hh * 60 + mm);
+    bars.push({ slot, t: hm, o: +seg[1] || c, c, h: +seg[3] || c, l: +seg[4] || c, v: +seg[5] || 0, amt: +seg[6] || 0, avg: +seg[7] || null });
   }
-  return { pre, pts };
+  if (!bars.length) return null;
+  return { pre, bars, fake: false };
 }
 
 /* 分钟 -> 图表 slot（09:30=0, 11:30=120, 13:00=121, 15:00=241） */
@@ -1031,90 +1034,603 @@ function renderList() {
   $('#tableFoot').textContent = `共 ${rows.length} 条${rows.length !== (S.day[S.tab] || []).length ? '（已筛选）' : ''}`;
 }
 
-/* ---------------------------- modal ---------------------------- */
-async function openStock(code, name) {
-  $('#modalTitle').innerHTML = `${esc(name || code)}<span class="sub">${code}</span>`;
-  $('#modal').classList.add('on');
-  if (!S.minute.has(code)) {
-    const row = (S.day.zt || []).find((s) => s.code === code);
-    if (row && row.tp) S.minute.set(code, { pre: 100, pts: row.tp.map((v, i) => [tpSlot(i), 100 + v]) });
+/* ---------------------------- stock chart ---------------------------- */
+const PERIODS = [
+  { key: 'intra', label: '分时' },
+  { key: '15', label: '15分' },
+  { key: '30', label: '30分' },
+  { key: 'day', label: '日K' },
+  { key: 'week', label: '周K' },
+  { key: 'month', label: '月K' },
+];
+const KLT = { 15: 15, 30: 30, day: 101, week: 102, month: 103 };
+const KLMT = { 15: 240, 30: 240, day: 160, week: 140, month: 72 };
+
+function maOf(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  let sum = 0;
+  for (let i = 0; i < vals.length; i++) {
+    sum += vals[i];
+    if (i >= n) sum -= vals[i - n];
+    if (i >= n - 1) out[i] = sum / n;
   }
-  drawIntra(code);
-  try {
-    const m = await fetchMinute(code);
-    if (m) { S.minute.set(code, m); drawIntra(code); }
-  } catch (e) { /* keep tp fallback */ }
-  try { await drawKline(code); } catch (e) { console.error(e); }
+  return out;
 }
 
-function drawIntra(code) {
-  const m = S.minute.get(code);
-  const canvas = $('#chartIntra');
-  if (!m) {
-    const ctx = canvas.getContext('2d');
-    canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#9aa5b1'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('暂无分时数据', canvas.clientWidth / 2, canvas.clientHeight / 2);
-    return;
+function emaOf(vals, n) {
+  const k = 2 / (n + 1);
+  const out = [];
+  let prev = null;
+  for (const v of vals) {
+    if (v == null || !isFinite(v)) { out.push(prev); continue; }
+    prev = prev == null ? v : v * k + prev * (1 - k);
+    out.push(prev);
   }
-  const vals = new Array(242).fill(null);
-  for (const [slot, p] of m.pts) vals[slot] = (p - m.pre) / m.pre * 100;
-  drawLineChart(canvas, {
-    series: [{ name: '涨幅', color: vals[241] >= 0 ? '#ef4444' : '#16a34a', vals }],
-    xFrom: 0, xTo: 241,
-    xLabels: SLOT_LABELS,
-    yFmt: (v) => v.toFixed(1) + '%',
-    legend: false,
-    tipFmt: (items, idx) => `<div>${labelOfSlot(idx)}</div><div>${items[0] ? items[0].v.toFixed(2) + '%' : '—'}</div>`,
-  });
+  return out;
 }
 
-async function klineEm(code) {
+function rsiOf(vals, n) {
+  const out = new Array(vals.length).fill(null);
+  let up = 0, dn = 0;
+  for (let i = 1; i < vals.length; i++) {
+    const ch = vals[i] - vals[i - 1];
+    const u = Math.max(ch, 0), d = Math.max(-ch, 0);
+    if (i <= n) {
+      up += u; dn += d;
+      if (i === n) out[i] = up + dn === 0 ? 50 : up / (up + dn) * 100;
+    } else {
+      up = (up * (n - 1) + u) / n;
+      dn = (dn * (n - 1) + d) / n;
+      out[i] = up + dn === 0 ? 50 : up / (up + dn) * 100;
+    }
+  }
+  return out;
+}
+
+function calcInd(bars) {
+  const c = bars.map((b) => b.c);
+  const e12 = emaOf(c, 12), e26 = emaOf(c, 26);
+  const dif = c.map((_, i) => (e12[i] == null || e26[i] == null ? null : e12[i] - e26[i]));
+  const dea = emaOf(dif, 9);
+  const macd = dif.map((v, i) => (v == null || dea[i] == null ? null : (v - dea[i]) * 2));
+  const K = [], D = [], J = [];
+  let k = 50, d = 50;
+  for (let i = 0; i < bars.length; i++) {
+    const s = Math.max(0, i - 8);
+    let hh = -Infinity, ll = Infinity;
+    for (let j = s; j <= i; j++) { hh = Math.max(hh, bars[j].h); ll = Math.min(ll, bars[j].l); }
+    const rsv = hh === ll ? 50 : (bars[i].c - ll) / (hh - ll) * 100;
+    k = (2 / 3) * k + (1 / 3) * rsv;
+    d = (2 / 3) * d + (1 / 3) * k;
+    K.push(k); D.push(d); J.push(3 * k - 2 * d);
+  }
+  return {
+    ma5: maOf(c, 5), ma10: maOf(c, 10), ma20: maOf(c, 20),
+    dif, dea, macd, K, D, J,
+    rsi6: rsiOf(c, 6), rsi12: rsiOf(c, 12), rsi24: rsiOf(c, 24),
+  };
+}
+
+function fmtBarT(t, period) {
+  const s = String(t);
+  if (/^\d{12}$/.test(s)) return `${s.slice(4, 6)}-${s.slice(6, 8)} ${s.slice(8, 10)}:${s.slice(10, 12)}`;
+  if (s.length >= 16) return s.slice(5, 16);
+  if (s.length >= 10) return s.slice(5, 10);
+  return s;
+}
+
+function fmtVol(v) {
+  if (v == null || !isFinite(v)) return '—';
+  if (v >= 1e8) return (v / 1e8).toFixed(2) + '亿';
+  if (v >= 1e4) return (v / 1e4).toFixed(1) + '万';
+  return String(Math.round(v));
+}
+
+async function klineEm(code, period) {
   const secid = (isSh(code) ? '1.' : '0.') + code;
-  const url = `${API.EM_KLINE}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt=101&fqt=1&end=20500101&lmt=60`;
-  const j = await fetchJSON(url, 10000, 1);
+  const klt = KLT[period] || 101, lmt = KLMT[period] || 160;
+  const url = `${API.EM_KLINE}?secid=${secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt=${klt}&fqt=1&end=20500101&lmt=${lmt}`;
+  const j = await fetchJSON(url, 9000, 1);
   const k = j && j.data && j.data.klines;
   if (!k || !k.length) return null;
   return k.map((r) => {
     const c = r.split(',');
-    return { date: c[0], open: +c[1], close: +c[2], high: +c[3], low: +c[4] };
+    return { t: c[0], o: +c[1], c: +c[2], h: +c[3], l: +c[4], v: +c[5] || 0 };
   });
 }
 
-async function klineTx(code) {
+async function klineTx(code, period) {
   const key = (isSh(code) ? 'sh' : 'sz') + code;
-  const url = `${API.TX_KLINE}?param=${key},day,,,60,qfq`;
-  const j = await fetchJSON(url, 10000, 1);
-  const day = j && j.data && j.data[key] && (j.data[key].qfqday || j.data[key].day);
-  if (!day || !day.length) return null;
-  return day.map((r) => ({ date: r[0], open: +r[1], close: +r[2], high: +r[3], low: +r[4] }));
+  if (period === '15' || period === '30') {
+    const url = `${API.TX_MKLINE}?param=${key},m${period},,300`;
+    const j = await fetchJSON(url, 9000, 1);
+    const arr = j && j.data && j.data[key] && j.data[key][`m${period}`];
+    if (!arr || !arr.length) return null;
+    return arr.map((r) => ({ t: String(r[0]), o: +r[1], c: +r[2], h: +r[3], l: +r[4], v: +r[5] || 0 }));
+  }
+  const tp = period === 'week' ? 'week' : period === 'month' ? 'month' : 'day';
+  const url = `${API.TX_KLINE}?param=${key},${tp},,,${KLMT[period] || 160},qfq`;
+  const j = await fetchJSON(url, 9000, 1);
+  const arr = j && j.data && j.data[key] && (j.data[key]['qfq' + tp] || j.data[key][tp]);
+  if (!arr || !arr.length) return null;
+  return arr.map((r) => ({ t: String(r[0]), o: +r[1], c: +r[2], h: +r[3], l: +r[4], v: +r[5] || 0 }));
 }
 
-async function drawKline(code) {
-  let rows = null;
-  try { rows = await klineEm(code); } catch (e) { rows = null; }
-  if (!rows || !rows.length) {
-    try { rows = await klineTx(code); } catch (e) { rows = null; }
+async function fetchBars(code, period) {
+  let bars = null;
+  try { bars = await klineEm(code, period); } catch (e) { bars = null; }
+  if (!bars || !bars.length) {
+    try { bars = await klineTx(code, period); } catch (e) { bars = null; }
   }
-  const canvas = $('#chartKline');
-  if (!rows || !rows.length) {
-    const ctx = canvas.getContext('2d');
-    canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#9aa5b1'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText('暂无 K 线数据', canvas.clientWidth / 2, canvas.clientHeight / 2);
+  return bars;
+}
+
+function intraBars(m, fake) {
+  if (!m || !m.bars) return null;
+  return m.bars.map((b) => ({ ...b, fake, t: b.t || labelOfSlot(b.slot) }));
+}
+
+async function openStock(code, name) {
+  $('#modalTitle').innerHTML = `${esc(name || code)}<span class="sub">${code}</span>`;
+  $('#modal').classList.add('on');
+  S.stock = { code, name: name || code, period: 'intra', bars: null, ind: null, pre: null, hover: null, loading: true };
+  renderPeriodTabs();
+  bindStockChart();
+  setStockPeriod('intra');
+}
+
+function renderPeriodTabs() {
+  const box = $('#periodTabs');
+  if (!box) return;
+  box.innerHTML = PERIODS.map((p) => `<button data-p="${p.key}" class="${S.stock && S.stock.period === p.key ? 'on' : ''}">${p.label}</button>`).join('');
+  if (!box._bound) {
+    box._bound = true;
+    box.addEventListener('click', (e) => {
+      const b = e.target.closest('button[data-p]');
+      if (!b) return;
+      setStockPeriod(b.dataset.p);
+    });
+  }
+}
+
+async function setStockPeriod(period) {
+  const st = S.stock;
+  if (!st) return;
+  st.period = period;
+  st.hover = null;
+  st.loading = true;
+  st.bars = null; st.ind = null;
+  renderPeriodTabs();
+  setChartInfo(null);
+  drawStockChart();
+  const code = st.code;
+
+  if (period === 'intra') {
+    if (!S.minute.has(code)) {
+      const row = (S.day.zt || []).find((s) => s.code === code);
+      if (row && row.tp) {
+        S.minute.set(code, {
+          pre: 100,
+          fake: true,
+          bars: row.tp.map((v, i) => ({ slot: tpSlot(i), t: labelOfSlot(tpSlot(i)), o: 100 + v, c: 100 + v, h: 100 + v, l: 100 + v, v: 0, avg: null })),
+        });
+      }
+    }
+    const m = S.minute.get(code);
+    applyBars(m ? intraBars(m) : null, m ? m.pre : null, m ? !!m.fake : false);
+    try {
+      const mm = await fetchMinute(code);
+      if (mm && mm.bars && mm.bars.length > 1 && S.stock && S.stock.code === code && S.stock.period === 'intra') {
+        S.minute.set(code, mm);
+        applyBars(intraBars(mm), mm.pre, false);
+      }
+    } catch (e) { /* keep fallback */ }
     return;
   }
-  const vals = rows.map((r) => r.close);
-  drawLineChart(canvas, {
-    series: [{ name: '收盘', color: '#2563eb', vals }],
-    xFrom: 0, xTo: rows.length - 1,
-    xLabels: [[0, rows[0].date.slice(5)], [Math.floor(rows.length / 2), rows[Math.floor(rows.length / 2)].date.slice(5)], [rows.length - 1, rows[rows.length - 1].date.slice(5)]],
-    yFmt: (v) => v.toFixed(2),
-    legend: false,
+
+  const bars = await fetchBars(code, period);
+  if (!S.stock || S.stock.code !== code || S.stock.period !== period) return;
+  applyBars(bars, null);
+}
+
+function applyBars(bars, pre, fake) {
+  const st = S.stock;
+  if (!st) return;
+  st.bars = bars && bars.length ? bars : null;
+  st.fake = !!(fake && st.bars);
+  st.pre = pre || (st.bars && st.bars.length ? st.bars[0].o : null);
+  st.ind = st.bars ? calcInd(st.bars) : null;
+  st.loading = false;
+  st.hover = null;
+  drawStockChart();
+  setChartInfo(st.bars ? st.bars.length - 1 : null);
+}
+
+/* ---------------------------- chart paint ---------------------------- */
+const C_UP = '#ef4444', C_DN = '#16a34a', C_TXT = '#93a0b4', C_GRID = '#f0f4f9', C_MA5 = '#f59e0b', C_MA10 = '#8b5cf6', C_MA20 = '#0ea5e9';
+
+function drawStockChart() {
+  const canvas = $('#stockChart');
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.max(320, Math.round(rect.width));
+  const H = Math.max(300, Math.round(rect.height));
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const st = S.stock;
+  if (!st) return;
+  if (!st.bars || !st.bars.length) {
+    ctx.fillStyle = C_TXT; ctx.font = '13px "Microsoft YaHei", sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(st.loading ? '加载中…' : '暂无数据', W / 2, H / 2);
+    return;
+  }
+
+  const bars = st.bars, ind = st.ind, n = bars.length;
+  const isIntra = st.period === 'intra';
+  const padL = 8, padR = 60, padB = 20, topT = 6;
+  const iw = W - padL - padR;
+  const gap = 12;
+  const subH = Math.max(42, Math.min(64, Math.round((H - 150) / 4.6)));
+  const priceH = H - padB - topT - (subH * 4) - gap * 4;
+  const volH = subH, macdH = subH, kdjH = subH, rsiH = subH;
+
+  const paneTop = [];
+  let y = topT;
+  paneTop.push(y); y += priceH + gap;
+  paneTop.push(y); y += volH + gap;
+  paneTop.push(y); y += macdH + gap;
+  paneTop.push(y); y += kdjH + gap;
+  paneTop.push(y);
+
+  const stepX = iw / Math.max(1, n);
+  const bw = Math.max(1, Math.min(14, stepX * 0.72));
+  const X = (i) => (isIntra ? padL + (bars[i].slot / 241) * iw : padL + (i + 0.5) * stepX);
+
+  ctx.font = '10.5px "Microsoft YaHei", sans-serif';
+
+  /* ---- price pane ---- */
+  const pTop = paneTop[0];
+  let lo = Infinity, hi = -Infinity;
+  for (const b of bars) { lo = Math.min(lo, b.l); hi = Math.max(hi, b.h); }
+  if (!isFinite(lo) || !isFinite(hi)) return;
+  let pvmin, pvmax, toY;
+  if (isIntra) {
+    const pre = st.pre || bars[0].o || bars[0].c;
+    const dev = Math.max(
+      Math.max.apply(null, bars.map((b) => Math.abs((b.h - pre) / pre * 100))),
+      Math.max.apply(null, bars.map((b) => Math.abs((b.l - pre) / pre * 100))),
+      0.6,
+    );
+    pvmin = -dev * 1.08; pvmax = dev * 1.08;
+    toY = (b) => pTop + priceH / 2 - ((b.c - pre) / pre * 100) / pvmax * (priceH / 2);
+    // grid: percent labels
+    ctx.textAlign = 'left';
+    for (let g = 0; g <= 2; g++) {
+      const v = pvmax * (g / 2);
+      for (const s of [v, -v]) {
+        const yy = pTop + priceH / 2 - s / pvmax * (priceH / 2);
+        ctx.strokeStyle = s === 0 ? '#e2e8f2' : C_GRID;
+        ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + iw, yy); ctx.stroke();
+        ctx.fillStyle = s === 0 ? '#8d99ab' : s > 0 ? C_UP : C_DN;
+        ctx.fillText(s.toFixed(2) + '%', padL + iw + 6, yy + 3.5);
+      }
+    }
+    ctx.fillStyle = '#8d99ab';
+    ctx.textAlign = 'right';
+    ctx.fillText(fmtPrice(pre), padL + iw - 2, pTop + priceH / 2 - 4);
+  } else {
+    pvmin = lo; pvmax = hi;
+    const padV = (hi - lo) * 0.04 || 1;
+    pvmin -= padV; pvmax += padV;
+    toY = (b) => pTop + priceH - (b.c - pvmin) / (pvmax - pvmin) * priceH;
+    ctx.textAlign = 'left';
+    for (let g = 0; g <= 4; g++) {
+      const v = pvmin + (pvmax - pvmin) * (g / 4);
+      const yy = pTop + priceH - (g / 4) * priceH;
+      ctx.strokeStyle = C_GRID;
+      ctx.beginPath(); ctx.moveTo(padL, yy); ctx.lineTo(padL + iw, yy); ctx.stroke();
+      ctx.fillStyle = C_TXT;
+      ctx.fillText(fmtPrice(v), padL + iw + 6, yy + 3.5);
+    }
+  }
+
+  if (isIntra) {
+    // price line + fill
+    const path = new Path2D();
+    let started = false;
+    for (let i = 0; i < n; i++) {
+      const x = X(i), yy = toY(bars[i]);
+      if (!started) { path.moveTo(x, yy); started = true; } else path.lineTo(x, yy);
+    }
+    const last = bars[n - 1].c, first = st.pre || bars[0].o;
+    const lineColor = last >= first ? C_UP : C_DN;
+    const grad = ctx.createLinearGradient(0, pTop, 0, pTop + priceH);
+    grad.addColorStop(0, lineColor + '33');
+    grad.addColorStop(1, lineColor + '05');
+    const area = new Path2D(path);
+    area.lineTo(X(n - 1), pTop + priceH);
+    area.lineTo(X(0), pTop + priceH);
+    area.closePath();
+    ctx.fillStyle = grad; ctx.fill(area);
+    ctx.strokeStyle = lineColor; ctx.lineWidth = 1.4; ctx.stroke(path);
+    // avg line
+    const avg = bars.map((b) => b.avg).filter((v) => v != null);
+    if (avg.length === bars.length) {
+      ctx.beginPath();
+      let pen = false;
+      for (let i = 0; i < n; i++) {
+        const v = bars[i].avg;
+        if (v == null) { pen = false; continue; }
+        const x = X(i), yy = pTop + priceH / 2 - ((v - st.pre) / st.pre * 100) / pvmax * (priceH / 2);
+        if (!pen) { ctx.moveTo(x, yy); pen = true; } else ctx.lineTo(x, yy);
+      }
+      ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 1.1; ctx.stroke();
+    }
+  } else {
+    // candles
+    for (let i = 0; i < n; i++) {
+      const b = bars[i];
+      const x = X(i);
+      const up = b.c >= b.o;
+      const col = up ? C_UP : C_DN;
+      const yO = pTop + priceH - (b.o - pvmin) / (pvmax - pvmin) * priceH;
+      const yC = pTop + priceH - (b.c - pvmin) / (pvmax - pvmin) * priceH;
+      const yH = pTop + priceH - (b.h - pvmin) / (pvmax - pvmin) * priceH;
+      const yL = pTop + priceH - (b.l - pvmin) / (pvmax - pvmin) * priceH;
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, yH); ctx.lineTo(x, yL); ctx.stroke();
+      const top = Math.min(yO, yC), hgt = Math.max(1, Math.abs(yC - yO));
+      if (up) {
+        ctx.fillStyle = '#fff'; ctx.fillRect(x - bw / 2, top, bw, hgt);
+        ctx.strokeRect(x - bw / 2, top, bw, hgt);
+      } else {
+        ctx.fillStyle = col; ctx.fillRect(x - bw / 2, top, bw, hgt);
+      }
+    }
+    // MA lines
+    const mas = [[ind.ma5, C_MA5, 'MA5'], [ind.ma10, C_MA10, 'MA10'], [ind.ma20, C_MA20, 'MA20']];
+    for (const [arr, col] of mas) {
+      ctx.strokeStyle = col; ctx.lineWidth = 1.1; ctx.beginPath();
+      let pen = false;
+      for (let i = 0; i < n; i++) {
+        const v = arr[i];
+        if (v == null) { pen = false; continue; }
+        const x = X(i), yy = pTop + priceH - (v - pvmin) / (pvmax - pvmin) * priceH;
+        if (!pen) { ctx.moveTo(x, yy); pen = true; } else ctx.lineTo(x, yy);
+      }
+      ctx.stroke();
+    }
+    ctx.textAlign = 'left'; ctx.font = '10px "Microsoft YaHei", sans-serif';
+    let lx = padL + 2;
+    for (const [arr, col, name] of mas) {
+      const v = arr[n - 1];
+      ctx.fillStyle = col;
+      ctx.fillText(`${name} ${v == null ? '—' : fmtPrice(v)}`, lx, pTop + 10);
+      lx += 74;
+    }
+    ctx.font = '10.5px "Microsoft YaHei", sans-serif';
+  }
+
+  /* ---- volume ---- */
+  const vTop = paneTop[1];
+  const maxV = Math.max.apply(null, bars.map((b) => b.v || 0)) || 1;
+  ctx.fillStyle = C_TXT; ctx.textAlign = 'left';
+  ctx.fillText('VOL ' + fmtVol(bars[n - 1].v), padL + 2, vTop + 9);
+  for (let i = 0; i < n; i++) {
+    const b = bars[i];
+    const hgt = Math.max(0.5, (b.v || 0) / maxV * (volH - 12));
+    const base = isIntra ? (i > 0 ? bars[i - 1].c : (st.pre || b.o)) : b.o;
+    ctx.fillStyle = b.c >= base ? C_UP : C_DN;
+    ctx.globalAlpha = 0.75;
+    ctx.fillRect(X(i) - bw / 2, vTop + volH - hgt, bw, hgt);
+    ctx.globalAlpha = 1;
+  }
+
+  /* ---- MACD ---- */
+  const mTop = paneTop[2];
+  let mmax = 0;
+  for (let i = 0; i < n; i++) {
+    mmax = Math.max(mmax, Math.abs(ind.macd[i] || 0), Math.abs(ind.dif[i] || 0), Math.abs(ind.dea[i] || 0));
+  }
+  if (!mmax) mmax = 1;
+  const midY = mTop + macdH / 2;
+  ctx.strokeStyle = '#e8eef6';
+  ctx.beginPath(); ctx.moveTo(padL, midY); ctx.lineTo(padL + iw, midY); ctx.stroke();
+  for (let i = 0; i < n; i++) {
+    const v = ind.macd[i] || 0;
+    const hgt = Math.max(0.5, Math.abs(v) / mmax * (macdH / 2 - 3));
+    ctx.fillStyle = v >= 0 ? C_UP : C_DN;
+    ctx.globalAlpha = 0.7;
+    ctx.fillRect(X(i) - bw / 2, v >= 0 ? midY - hgt : midY, bw, hgt);
+    ctx.globalAlpha = 1;
+  }
+  ctx.strokeStyle = '#2563eb'; ctx.lineWidth = 1; ctx.beginPath();
+  let pen1 = false;
+  for (let i = 0; i < n; i++) {
+    const v = ind.dif[i];
+    if (v == null) { pen1 = false; continue; }
+    const x = X(i), yy = midY - v / mmax * (macdH / 2 - 3);
+    if (!pen1) { ctx.moveTo(x, yy); pen1 = true; } else ctx.lineTo(x, yy);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = '#f59e0b'; ctx.beginPath();
+  pen1 = false;
+  for (let i = 0; i < n; i++) {
+    const v = ind.dea[i];
+    if (v == null) { pen1 = false; continue; }
+    const x = X(i), yy = midY - v / mmax * (macdH / 2 - 3);
+    if (!pen1) { ctx.moveTo(x, yy); pen1 = true; } else ctx.lineTo(x, yy);
+  }
+  ctx.stroke();
+  ctx.fillStyle = C_TXT; ctx.textAlign = 'left';
+  ctx.fillText('MACD(12,26,9)', padL + 2, mTop + 9);
+
+  /* ---- KDJ ---- */
+  const kTop = paneTop[3];
+  const KY = (v) => kTop + kdjH - (Math.max(-30, Math.min(130, v)) + 30) / 160 * kdjH;
+  for (const lv of [20, 80]) {
+    ctx.strokeStyle = '#eef2f8';
+    ctx.beginPath(); ctx.moveTo(padL, KY(lv)); ctx.lineTo(padL + iw, KY(lv)); ctx.stroke();
+  }
+  const kseries = [[ind.K, '#2563eb', 'K'], [ind.D, '#f59e0b', 'D'], [ind.J, '#a855f7', 'J']];
+  for (const [arr, col] of kseries) {
+    ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < n; i++) {
+      const v = arr[i];
+      if (v == null) { pen = false; continue; }
+      const x = X(i), yy = KY(v);
+      if (!pen) { ctx.moveTo(x, yy); pen = true; } else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = C_TXT; ctx.textAlign = 'left';
+  ctx.fillText('KDJ(9,3,3)', padL + 2, kTop + 9);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#b9c2d0';
+  ctx.fillText('80', padL + iw + 56, KY(80) + 3);
+  ctx.fillText('20', padL + iw + 56, KY(20) + 3);
+
+  /* ---- RSI ---- */
+  const rTop = paneTop[4];
+  const RY = (v) => rTop + rsiH - v / 100 * rsiH;
+  for (const lv of [30, 70]) {
+    ctx.strokeStyle = '#eef2f8';
+    ctx.beginPath(); ctx.moveTo(padL, RY(lv)); ctx.lineTo(padL + iw, RY(lv)); ctx.stroke();
+  }
+  const rseries = [[ind.rsi6, '#2563eb', 'RSI6'], [ind.rsi12, '#f59e0b', 'RSI12'], [ind.rsi24, '#a855f7', 'RSI24']];
+  for (const [arr, col] of rseries) {
+    ctx.strokeStyle = col; ctx.lineWidth = 1; ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < n; i++) {
+      const v = arr[i];
+      if (v == null) { pen = false; continue; }
+      const x = X(i), yy = RY(v);
+      if (!pen) { ctx.moveTo(x, yy); pen = true; } else ctx.lineTo(x, yy);
+    }
+    ctx.stroke();
+  }
+  ctx.fillStyle = C_TXT; ctx.textAlign = 'left';
+  ctx.fillText('RSI(6,12,24)', padL + 2, rTop + 9);
+
+  /* ---- x labels ---- */
+  ctx.textAlign = 'center'; ctx.fillStyle = C_TXT;
+  if (isIntra) {
+    const xs = [[0, '09:30'], [60, '10:30'], [120, '11:30/13:00'], [181, '14:00'], [241, '15:00']];
+    for (const [slot, lab] of xs) {
+      const x = padL + (slot / 241) * iw;
+      ctx.fillText(lab, x, H - 6);
+    }
+  } else {
+    const picks = Math.min(5, n);
+    for (let g = 0; g < picks; g++) {
+      const i = Math.round((n - 1) * (g / Math.max(1, picks - 1)));
+      ctx.fillText(fmtBarT(bars[i].t, st.period), X(i), H - 6);
+    }
+  }
+
+  /* ---- crosshair ---- */
+  if (st.hover != null && st.hover >= 0 && st.hover < n) {
+    const hx = X(st.hover);
+    ctx.strokeStyle = '#b6c2d4'; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(hx, pTop); ctx.lineTo(hx, rTop + rsiH); ctx.stroke();
+    const b = bars[st.hover];
+    if (!isIntra) {
+      const hy = pTop + priceH - (b.c - pvmin) / (pvmax - pvmin) * priceH;
+      ctx.beginPath(); ctx.moveTo(padL, hy); ctx.lineTo(padL + iw, hy); ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+}
+
+function setChartInfo(idx) {
+  const el = $('#chartInfo');
+  const st = S.stock;
+  if (!el || !st) return;
+  if (!st.bars || !st.bars.length) { el.innerHTML = st.loading ? '<span class="muted">加载中…</span>' : '<span class="muted">暂无数据</span>'; return; }
+  const i = idx == null ? st.bars.length - 1 : Math.max(0, Math.min(st.bars.length - 1, idx));
+  const b = st.bars[i];
+  const ind = st.ind;
+  const base = st.period === 'intra' ? st.pre : (i > 0 ? st.bars[i - 1].c : (st.pre || b.o));
+  const chg = base ? (b.c - base) / base * 100 : 0;
+  const fake = st.period === 'intra' && st.fake;
+  const cls = chg >= 0 ? 'up' : 'down';
+  const pct = (v) => (v == null ? '—' : v.toFixed(2));
+  const parts = [];
+  if (b.t) parts.push(`<span><b>${esc(fmtBarT(b.t, st.period))}</b></span>`);
+  if (fake) {
+    parts.push(`<span class="${cls}"><b>${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</b></span>`);
+    parts.push('<span class="muted">分时采样</span>');
+  } else {
+    parts.push(`<span>开 <b>${fmtPrice(b.o)}</b></span>`);
+    parts.push(`<span>高 <b>${fmtPrice(b.h)}</b></span>`);
+    parts.push(`<span>低 <b>${fmtPrice(b.l)}</b></span>`);
+    parts.push(`<span>收 <b class="${cls}">${fmtPrice(b.c)}</b></span>`);
+    parts.push(`<span class="${cls}"><b>${chg >= 0 ? '+' : ''}${chg.toFixed(2)}%</b></span>`);
+    parts.push(`<span>量 <b>${fmtVol(b.v)}</b></span>`);
+  }
+  if (ind) {
+    parts.push(`<span class="k">MACD <b>${pct(ind.dif[i])}</b>/<b>${pct(ind.dea[i])}</b>/<b>${pct(ind.macd[i])}</b></span>`);
+    parts.push(`<span class="k">KDJ <b>${pct(ind.K[i])}</b>/<b>${pct(ind.D[i])}</b>/<b>${pct(ind.J[i])}</b></span>`);
+    parts.push(`<span class="k">RSI <b>${pct(ind.rsi6[i])}</b>/<b>${pct(ind.rsi12[i])}</b>/<b>${pct(ind.rsi24[i])}</b></span>`);
+  }
+  el.innerHTML = parts.join('');
+}
+
+function fmtPrice(v) {
+  if (v == null || !isFinite(v)) return '—';
+  return v >= 100 ? v.toFixed(2) : v.toFixed(v < 10 ? 2 : 2);
+}
+
+function bindStockChart() {
+  const canvas = $('#stockChart');
+  if (!canvas || canvas._bound) return;
+  canvas._bound = true;
+  const pick = (ev) => {
+    const st = S.stock;
+    if (!st || !st.bars || !st.bars.length) return null;
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left;
+    const padL = 8, padR = 60;
+    const iw = r.width - padL - padR;
+    if (mx < padL || mx > padL + iw) return null;
+    const n = st.bars.length;
+    if (st.period === 'intra') {
+      const slot = (mx - padL) / iw * 241;
+      let best = null, bd = 1e9;
+      for (let i = 0; i < n; i++) {
+        const d = Math.abs(st.bars[i].slot - slot);
+        if (d < bd) { bd = d; best = i; }
+      }
+      return best;
+    }
+    return Math.max(0, Math.min(n - 1, Math.floor((mx - padL) / (iw / n))));
+  };
+  canvas.addEventListener('mousemove', (ev) => {
+    const st = S.stock;
+    if (!st) return;
+    const idx = pick(ev);
+    if (idx == null) { if (st.hover != null) { st.hover = null; drawStockChart(); setChartInfo(null); } return; }
+    if (idx !== st.hover) { st.hover = idx; drawStockChart(); setChartInfo(idx); }
+  });
+  canvas.addEventListener('mouseleave', () => {
+    if (!S.stock) return;
+    S.stock.hover = null;
+    drawStockChart();
+    setChartInfo(null);
   });
 }
+
+let _resizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!$('#modal') || !$('#modal').classList.contains('on')) return;
+  clearTimeout(_resizeTimer);
+  _resizeTimer = setTimeout(() => drawStockChart(), 120);
+});
 
 /* ---------------------------- export ---------------------------- */
 function exportCSV() {
