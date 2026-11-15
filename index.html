@@ -1,177 +1,148 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>A股涨停跟踪</title>
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="alternate icon" href="favicon-32.png" type="image/png">
-  <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <link rel="stylesheet" href="style.css">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>A股涨停跟踪</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="alternate icon" href="favicon-32.png" type="image/png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="site-header">
-    <div class="container topbar">
-      <div class="brand">
-        <div class="logo">涨</div>
-        <div>
-          <h1>A股涨停跟踪</h1>
-          <p class="sub">涨停板 · 炸板 · 跌停 实时行情与情绪总结</p>
-        </div>
+
+<header class="hdr">
+  <div class="hdr-in">
+    <div class="brand">
+      <div class="logo">涨</div>
+      <div class="brand-txt">
+        <h1>A股涨停跟踪</h1>
+        <p>涨停 · 连板 · 板块强度</p>
       </div>
+    </div>
+
+    <div class="hdr-right">
       <div class="date-nav">
         <button id="prevDay" class="icon-btn" title="上一交易日">‹</button>
         <input type="date" id="dateInput">
         <button id="nextDay" class="icon-btn" title="下一交易日">›</button>
-        <button id="todayBtn" class="primary-btn">今天</button>
-        <button id="refreshBtn" class="primary-btn">刷新</button>
+        <button id="todayBtn" class="ghost-btn">今天</button>
       </div>
-    </div>
-  </header>
-
-  <div class="container">
-    <div class="statusbar">
-      <div class="left">
-        <span class="live-dot" id="liveDot"></span>
-        <span id="statusText">初始化…</span>
-        <span class="countdown" id="countdown"></span>
-      </div>
-      <div class="right">
-        <label class="chk" title="当你停留在最新交易日时，新交易日数据出现后自动切换过去"><input type="checkbox" id="followLatest" checked> 自动切换新交易日</label>
-        <button id="pauseBtn" class="ghost-btn small">暂停</button>
-      </div>
-    </div>
-
-    <main>
-      <section class="cards" id="cards"></section>
-
-      <section class="panel summary-panel">
-        <div class="panel-title">今日总结</div>
-        <p id="summaryText" class="summary-text">加载中…</p>
-      </section>
-
-      <section class="panel auction-panel">
-        <div class="panel-head">
-          <div class="panel-title">开盘竞价涨停</div>
-          <span class="panel-note">集合竞价（09:25）即封板 · 实时更新</span>
-        </div>
-        <div class="statline" id="auctionStats"></div>
-        <div class="auction-wrap" id="auctionTable"></div>
-        <div class="zb-note" id="auctionZbNote"></div>
-      </section>
-
-      <section class="panel ladder-panel">
-        <div class="panel-head">
-          <div class="panel-title">连板梯队</div>
-          <span class="panel-note" id="ladderStats"></span>
-        </div>
-        <div class="ladder" id="ladderList"></div>
-      </section>
-
-      <section class="charts">
-        <div class="chart-card">
-          <div class="chart-title">连板高度分布</div>
-          <canvas id="chartLb"></canvas>
-        </div>
-        <div class="chart-card">
-          <div class="chart-title">封板时间分布</div>
-          <canvas id="chartTime"></canvas>
-        </div>
-        <div class="chart-card wide">
-          <div class="chart-title">行业热度 TOP10</div>
-          <canvas id="chartInd"></canvas>
-        </div>
-      </section>
-
-      <section class="panel board-panel">
-        <div class="panel-head">
-          <div class="panel-title">行情板块</div>
-          <div class="board-tabs" id="boardTabs">
-            <button class="board-tab active" data-mode="featured">精选板块</button>
-            <button class="board-tab" data-mode="all">全部板块</button>
-          </div>
-          <div class="board-type" id="boardType" style="display:none">
-            <button class="board-type-btn active" data-type="2">行业</button>
-            <button class="board-type-btn" data-type="3">概念</button>
-            <button class="board-type-btn" data-type="1">地域</button>
-          </div>
-          <input type="search" id="boardSearch" placeholder="搜索板块名称" style="display:none">
-        </div>
-      <div class="board-note">行情板块数据来自新浪财经 · 强度 = 涨停家数×100 + 涨跌幅×10 + 领涨股涨幅</div>
-      <div class="board-summary" id="boardSummary"></div>
-        <div id="boardBody"></div>
-      </section>
-
-      <section class="panel strong-panel">
-        <div class="panel-head">
-          <div class="panel-title">强势股池</div>
-          <span class="panel-note">东财强势股池 · 60日新高或近期多次涨停 · 实时更新</span>
-          <div class="strong-tools">
-            <input type="search" id="strongSearch" placeholder="搜索代码 / 名称 / 行业">
-            <button id="strongExportBtn" class="ghost-btn small">导出 CSV</button>
-          </div>
-        </div>
-        <div class="statline" id="strongStats"></div>
-        <div id="strongBody"></div>
-      </section>
-
-      <section class="panel table-panel">
-        <div class="toolbar">
-          <div class="tabs" id="tabs">
-            <button class="tab active" data-tab="zt">涨停板 <span class="cnt" id="cntZt"></span></button>
-            <button class="tab" data-tab="zb">炸板 <span class="cnt" id="cntZb"></span></button>
-            <button class="tab" data-tab="dt">跌停 <span class="cnt" id="cntDt"></span></button>
-          </div>
-          <div class="filters">
-            <input type="search" id="search" placeholder="搜索代码 / 名称">
-            <select id="lbcFilter">
-              <option value="all">全部连板</option>
-              <option value="1">首板</option>
-              <option value="2">2 板</option>
-              <option value="3">3 板</option>
-              <option value="4">4 板</option>
-              <option value="5">5 板</option>
-              <option value="5p">6 板及以上</option>
-            </select>
-            <select id="industryFilter"><option value="">全部行业</option></select>
-            <button id="exportBtn" class="ghost-btn">导出 CSV</button>
-          </div>
-        </div>
-        <div class="table-wrap">
-          <table id="stockTable">
-            <thead id="thead"></thead>
-            <tbody id="tbody"></tbody>
-          </table>
-        </div>
-        <div class="table-foot" id="tableFoot"></div>
-      </section>
-    </main>
-
-    <footer>数据来源：东方财富涨停板行情 · 仅供复盘学习参考，不构成投资建议</footer>
-  </div>
-
-  <div id="loading"><div class="spinner"></div></div>
-  <div id="toast"></div>
-
-  <div class="modal-mask" id="chartModal">
-    <div class="modal">
-      <div class="modal-head">
-        <div class="modal-title" id="modalTitle"></div>
-        <button class="modal-close" id="modalClose" title="关闭">&times;</button>
-      </div>
-      <div class="modal-body">
-        <div class="mini-chart">
-          <div class="mini-title">分时走势</div>
-          <canvas id="chartIntra"></canvas>
-        </div>
-        <div class="mini-chart">
-          <div class="mini-title">日K线（前复权）</div>
-          <canvas id="chartKline"></canvas>
-        </div>
+      <button id="refreshBtn" class="primary-btn">刷新</button>
+      <div class="status">
+        <span id="liveDot" class="dot"></span>
+        <span id="statusText">加载中…</span>
       </div>
     </div>
   </div>
+</header>
 
-  <script src="app.js"></script>
+<div class="wrap">
+
+  <section class="stats" id="stats"></section>
+
+  <nav class="views" id="viewTabs">
+    <button class="on" data-view="relay">接力复盘</button>
+    <button data-view="sector">板块强度</button>
+    <button data-view="list">涨停明细</button>
+  </nav>
+
+  <!-- 接力复盘 -->
+  <section class="panel view" id="viewRelay">
+    <div class="rules">
+      <span class="rules-label">排序规则</span>
+      <div class="tabs rule-tabs" id="ruleTabs">
+        <button class="on" data-rule="hot">今日行情</button>
+        <button data-rule="chg">涨幅</button>
+        <button data-rule="first">首封</button>
+        <button data-rule="open">未封</button>
+        <button data-rule="order">封单</button>
+        <button data-rule="amount">成交额</button>
+        <button data-rule="cap">实际流通</button>
+        <button data-rule="turnover">实际换手</button>
+      </div>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="ladder" id="ladder"></div>
+  </section>
+
+  <!-- 板块强度 -->
+  <section class="panel view hidden" id="viewSector">
+    <div class="sector-head">
+      <div class="tabs" id="sectorMode">
+        <button class="on" data-m="chg">板块涨幅</button>
+        <button data-m="strength">板块强度</button>
+        <button data-m="zt">涨停家数</button>
+      </div>
+      <div class="sector-hint" id="sectorHint">勾选左侧板块对比分时走势</div>
+    </div>
+    <div class="sector-body">
+      <aside class="sector-list" id="sectorList"></aside>
+      <div class="sector-chart">
+        <canvas id="sectorCanvas"></canvas>
+        <div class="tip" id="sectorTip"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 涨停明细 -->
+  <section class="panel view hidden" id="viewList">
+    <div class="list-head">
+      <div class="tabs" id="tabTabs">
+        <button class="on" data-tab="zt">涨停 <span id="cntZt">0</span></button>
+        <button data-tab="zb">炸板 <span id="cntZb">0</span></button>
+        <button data-tab="dt">跌停 <span id="cntDt">0</span></button>
+      </div>
+      <div class="list-tools">
+        <input type="search" id="search" placeholder="搜索代码 / 名称 / 板块">
+        <select id="levelFilter">
+          <option value="">全部连板</option>
+          <option value="1">首板</option>
+          <option value="2">2 板</option>
+          <option value="3">3 板</option>
+          <option value="4">4 板</option>
+          <option value="5">5 板</option>
+          <option value="6">6 板及以上</option>
+        </select>
+        <button id="exportBtn" class="ghost-btn">导出 CSV</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="stockTable">
+        <thead id="thead"></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="table-foot" id="tableFoot"></div>
+  </section>
+
+  <footer class="foot">
+    数据：同花顺涨停池 · 东方财富行情 · 腾讯分时　|　仅供复盘学习，不构成投资建议
+  </footer>
+</div>
+
+<div id="loading"><div class="spinner"></div></div>
+<div id="toast"></div>
+
+<div class="modal" id="modal">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div id="modalTitle"></div>
+      <button class="icon-btn" id="modalClose">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="mini">
+        <div class="mini-title">分时</div>
+        <canvas id="chartIntra"></canvas>
+      </div>
+      <div class="mini">
+        <div class="mini-title">日 K</div>
+        <canvas id="chartKline"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
 </body>
 </html>

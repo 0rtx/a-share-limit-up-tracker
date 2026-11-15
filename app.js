@@ -1,1658 +1,1225 @@
 'use strict';
 
-const UT = '7eea3edcaed734bea9cbfc24409ed989';
-const DPT = 'wz.ztzt';
-const BASE = 'https://push2ex.eastmoney.com/';
-const EP = { zt: 'getTopicZTPool', zb: 'getTopicZBPool', dt: 'getTopicDTPool', qs: 'getTopicQSPool' };
+/* =====================================================================
+   A股涨停跟踪 —— 接力复盘 / 板块强度
+   数据：同花顺涨停池 + 东财行情 + 腾讯分时
+   ===================================================================== */
 
-const TIME_BUCKETS = [
-  { label: '竞价', from: 0, to: 92959 },
-  { label: '09:30-10:00', from: 93000, to: 100000 },
-  { label: '10:00-10:30', from: 100000, to: 103000 },
-  { label: '10:30-11:00', from: 103000, to: 110000 },
-  { label: '11:00-11:30', from: 110000, to: 113000 },
-  { label: '13:00-13:30', from: 130000, to: 133000 },
-  { label: '13:30-14:00', from: 133000, to: 140000 },
-  { label: '14:00-14:30', from: 140000, to: 143000 },
-  { label: '14:30-15:00', from: 143000, to: 150100 }
+const $ = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+
+const API = {
+  THS_POOL: 'https://data.10jqka.com.cn/dataapi/limit_up/limit_up_pool',
+  THS_BLOCK: 'https://data.10jqka.com.cn/dataapi/limit_up/block_top',
+  EM_UT: '7eea3edcaed734bea9cbfc24409ed989',
+  EM_POOL: 'https://push2ex.eastmoney.com/',
+  EM_QUOTE: 'https://push2.eastmoney.com/api/qt/ulist.np/get',
+  EM_TREND: 'https://push2.eastmoney.com/api/qt/stock/trends2/get',
+  TX_MIN: 'https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=',
+  TX_K: 'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=',
+};
+const THS_FIELDS = '199112,10,9001,330323,330324,330325,9002,330329,133971,133970,1968584,3475914,9003,9004';
+
+const S = {
+  date: null,
+  latestDate: null,
+  view: 'relay',
+  rule: 'hot',
+  chip: null,
+  tab: 'zt',
+  search: '',
+  level: '',
+  day: null,          // {zt, zb, dt, prev, blocks, quotes, prevDate}
+  quotes: new Map(),  // code -> {chg, price, amt, turnover, flowCap, mainIn}
+  minute: new Map(),  // code -> {pre, pts}
+  minutePending: new Set(),
+  blockMeta: new Map(), // code -> [blockName]
+  autoTimer: null,
+  loading: false,
+  boardMode: 'chg',
+  boardSel: new Set(),
+  boardCurves: null,
+  legendRects: [],
+};
+
+/* ------------------------------ utils ------------------------------ */
+const pad2 = (n) => String(n).padStart(2, '0');
+const ds = (d) => `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}`;
+const dsToDate = (s) => new Date(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8));
+const shiftDay = (s, n) => { const d = dsToDate(s); d.setDate(d.getDate() + n); return ds(d); };
+const isWeekend = (s) => { const w = dsToDate(s).getDay(); return w === 0 || w === 6; };
+
+function fmtAmt(v) {
+  if (v == null || isNaN(v)) return '—';
+  const n = Math.abs(v);
+  if (n >= 1e8) return (v / 1e8).toFixed(2) + '亿';
+  if (n >= 1e4) return (v / 1e4).toFixed(0) + '万';
+  return String(Math.round(v));
+}
+function fmtPct(v, signed = true) {
+  if (v == null || isNaN(v)) return '—';
+  return (signed && v > 0 ? '+' : '') + v.toFixed(2) + '%';
+}
+function pctOf(v) {
+  if (v == null || v === '' || isNaN(v)) return '—';
+  return (+v).toFixed(2) + '%';
+}
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+/* unix 秒（北京时间）-> HH:MM:SS */
+function fmtTs(sec) {
+  if (!sec) return '—';
+  const d = new Date(+sec * 1000 + 8 * 3600 * 1000);
+  return `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`;
+}
+/* 东财 93015 -> 09:30:15 */
+function fmtEmTime(v) {
+  if (!v) return '—';
+  const s = String(v).padStart(6, '0');
+  return `${s.slice(0, 2)}:${s.slice(2, 4)}:${s.slice(4, 6)}`;
+}
+function isSh(code) { return code.startsWith('6'); }
+function mkName(code) {
+  if (code.startsWith('68')) return '创';
+  if (code.startsWith('30')) return '创';
+  if (code.startsWith('8') || code.startsWith('4') || code.startsWith('92')) return '北';
+  return isSh(code) ? '沪' : '深';
+}
+function marketOf(code) { return isSh(code) ? '1' : '0'; }
+
+async function fetchJSON(url, timeout = 12000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeout);
+  try {
+    const r = await fetch(url, { signal: ctl.signal, cache: 'no-store' });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+function jsonp(url, cbParam = 'cb', timeout = 12000) {
+  return new Promise((resolve, reject) => {
+    const name = cbParam + '_' + Math.random().toString(36).slice(2);
+    const script = document.createElement('script');
+    let done = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      try { delete window[name]; } catch (e) { /* ignore */ }
+      if (script.parentNode) script.parentNode.removeChild(script);
+    };
+    window[name] = (data) => { if (done) return; done = true; cleanup(); resolve(data); };
+    script.onerror = () => { if (done) return; done = true; cleanup(); reject(new Error('jsonp error')); };
+    const timer = setTimeout(() => {
+      if (done) return; done = true; cleanup(); reject(new Error('jsonp timeout'));
+    }, timeout);
+    script.src = url + (url.includes('?') ? '&' : '?') + cbParam + '=' + name;
+    document.head.appendChild(script);
+  });
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) {
+      const idx = i++;
+      try { out[idx] = await fn(items[idx], idx); } catch (e) { out[idx] = null; }
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/* ---------------------------- data layer ---------------------------- */
+function levelOf(x) {
+  const v = +x.high_days_value;
+  if (v > 0) {
+    // 高 16 位 = 连板数，低 16 位 = 统计天数（65537=首板，131074=2天2板，196613=5天3板）
+    const lv = Math.floor(v / 65536);
+    if (lv > 0) return lv;
+  }
+  const m = /(\d+)\s*板/.exec(x.high_days || '');
+  if (m) return +m[1];
+  return 1;
+}
+
+function normThs(x) {
+  return {
+    code: String(x.code),
+    name: x.name,
+    price: +x.latest,
+    chg: +x.change_rate,
+    turnover: +x.turnover_rate,
+    orderAmt: +x.order_amount,
+    openNum: +x.open_num,
+    type: x.limit_up_type,
+    level: levelOf(x),
+    daysText: x.high_days,
+    first: x.first_limit_up_time || 0,
+    last: x.last_limit_up_time || 0,
+    reason: x.reason_type || '',
+    flowCap: x.currency_value,
+    tag: x.change_tag || '',
+  };
+}
+
+async function fetchThsPool(date) {
+  const url = `${API.THS_POOL}?page=1&limit=200&field=${THS_FIELDS}&filter=HS,GEM2STAR&order_field=330324&order_type=0&date=${date}`;
+  const j = await fetchJSON(url);
+  if (!j || j.status_code !== 0 || !j.data || !Array.isArray(j.data.info)) return [];
+  return j.data.info.map(normThs);
+}
+
+async function fetchThsBlocks(date) {
+  const url = `${API.THS_BLOCK}?filter=HS,GEM2STAR&date=${date}`;
+  const j = await fetchJSON(url);
+  if (!j || j.status_code !== 0 || !Array.isArray(j.data)) return [];
+  return j.data.map((b) => ({
+    name: b.name,
+    code: b.code,
+    chg: +b.change,
+    zt: +b.limit_up_num,
+    cont: +b.continuous_plate_num,
+    high: b.high,
+    days: b.days,
+    stocks: (b.stock_list || []).map((s) => ({
+      code: String(s.code),
+      chg: +s.change_rate,
+      first: s.first_limit_up_time || 0,
+      concept: s.concept || '',
+      reason: s.reason_info || '',
+    })),
+  })).filter((b) => b.zt > 0);
+}
+
+function emPoolUrl(kind, date) {
+  const page = kind === 'zt' ? 'getTopicZTPool' : kind === 'zb' ? 'getTopicZBPool' : 'getTopicDTPool';
+  const sort = kind === 'zt' ? 'fbt:asc' : kind === 'zb' ? 'fbt:asc' : 'fund:asc';
+  return `${API.EM_POOL}${page}?ut=${API.EM_UT}&dpt=wz.ztzt&Pageindex=0&pagesize=500&sort=${sort}&date=${date}&_=${Date.now()}`;
+}
+
+function normEm(x) {
+  return {
+    code: String(x.c),
+    name: x.n,
+    price: x.p != null ? x.p / 1000 : null,
+    chg: x.zdp,
+    turnover: x.hs,
+    amount: x.amount,
+    orderAmt: x.fund,
+    openNum: x.zbc || 0,
+    first: x.fbt,
+    last: x.lbt,
+    industry: x.hybk || '',
+    days: x.zttj ? x.zttj.days : (x.days || 0),
+    cont: x.zttj ? x.zttj.ct : 0,
+    flowCap: x.ltsz,
+  };
+}
+
+async function fetchEmPool(kind, date) {
+  const j = await jsonp(emPoolUrl(kind, date));
+  if (!j || !j.data || !Array.isArray(j.data.pool)) return [];
+  return j.data.pool.map(normEm);
+}
+
+async function fetchQuotes(codes) {
+  const uniq = Array.from(new Set(codes)).filter(Boolean);
+  const out = new Map();
+  const chunks = [];
+  for (let i = 0; i < uniq.length; i += 60) chunks.push(uniq.slice(i, i + 60));
+  await mapLimit(chunks, 3, async (chunk) => {
+    const secids = chunk.map((c) => marketOf(c) + '.' + c).join(',');
+    const url = `${API.EM_QUOTE}?fltt=2&invt=2&fields=f2,f3,f6,f8,f12,f20,f21,f62&secids=${secids}`;
+    const j = await fetchJSON(url);
+    const list = (j && j.data && j.data.diff) || [];
+    const num = (v) => (v === '-' || v === null || v === undefined || v === '' ? null : +v);
+    for (const q of list) {
+      out.set(String(q.f12), {
+        price: num(q.f2),
+        chg: num(q.f3),
+        amt: num(q.f6),
+        turnover: num(q.f8),
+        totalCap: num(q.f20),
+        flowCap: num(q.f21),
+        mainIn: num(q.f62),
+      });
+    }
+  });
+  for (const [k, v] of out) if (v.chg == null) out.delete(k);
+  return out;
+}
+
+async function fetchMinute(code) {
+  const sym = (isSh(code) ? 'sh' : 'sz') + code;
+  const j = await fetchJSON(API.TX_MIN + sym, 10000);
+  const d = j && j.data && j.data[sym];
+  if (!d || !d.data || !d.data.data) return null;
+  const qt = d.qt && d.qt[sym];
+  const pre = qt ? +qt[4] : 0;
+  const pts = [];
+  for (const row of d.data.data) {
+    const seg = row.split(' ');
+    const t = seg[0];
+    if (t.length < 4) continue;
+    const hh = +t.slice(0, 2), mm = +t.slice(2, 4);
+    const p = +seg[1];
+    if (!p) continue;
+    pts.push([slotOf(hh * 60 + mm), p]);
+  }
+  return { pre, pts };
+}
+
+/* 分钟 -> 图表 slot（09:30=0, 11:30=120, 13:00=121, 15:00=241） */
+function slotOf(min) {
+  if (min <= 690) return min - 570;
+  return 120 + (min - 780) + 1;
+}
+const SLOT_LABELS = [
+  [0, '09:30'], [60, '10:30'], [120, '11:30/13:00'], [181, '14:00'], [241, '15:00'],
 ];
 
-const LEFT_KEYS = new Set(['code', 'name', 'hybk']);
+/* 找上一个有数据的交易日 */
+async function resolvePrevDate(date) {
+  let d = shiftDay(date, -1);
+  for (let i = 0; i < 12; i++) {
+    if (!isWeekend(d)) {
+      try {
+        const pool = await fetchThsPool(d);
+        if (pool.length) return { date: d, pool };
+      } catch (e) { /* continue */ }
+    }
+    d = shiftDay(d, -1);
+  }
+  return { date: null, pool: [] };
+}
 
-const COLS = {
-  zt: [
-    { k: 'idx', label: '#' },
-    { k: 'code', label: '代码', sort: 'c' },
-    { k: 'name', label: '名称', sort: 'n' },
-    { k: 'price', label: '最新价', sort: 'p', num: true },
-    { k: 'zdp', label: '涨跌幅', sort: 'zdp', num: true },
-    { k: 'lbc', label: '连板', sort: 'lbc', num: true },
-    { k: 'zttj', label: '涨停统计', sort: 'zttj' },
-    { k: 'fbt', label: '首次封板', sort: 'fbt' },
-    { k: 'lbt', label: '最后封板', sort: 'lbt' },
-    { k: 'zbc', label: '炸板', sort: 'zbc', num: true },
-    { k: 'fund', label: '封单资金', sort: 'fund', num: true },
-    { k: 'hs', label: '换手率', sort: 'hs', num: true },
-    { k: 'amount', label: '成交额', sort: 'amount', num: true },
-    { k: 'hybk', label: '行业', sort: 'hybk' }
-  ],
-  zb: [
-    { k: 'idx', label: '#' },
-    { k: 'code', label: '代码', sort: 'c' },
-    { k: 'name', label: '名称', sort: 'n' },
-    { k: 'price', label: '最新价', sort: 'p', num: true },
-    { k: 'zdp', label: '涨跌幅', sort: 'zdp', num: true },
-    { k: 'zf', label: '振幅', sort: 'zf', num: true },
-    { k: 'fbt', label: '首次封板', sort: 'fbt' },
-    { k: 'zbc', label: '炸板次数', sort: 'zbc', num: true },
-    { k: 'zttj', label: '涨停统计', sort: 'zttj' },
-    { k: 'hs', label: '换手率', sort: 'hs', num: true },
-    { k: 'amount', label: '成交额', sort: 'amount', num: true },
-    { k: 'hybk', label: '行业', sort: 'hybk' }
-  ],
-  dt: [
-    { k: 'idx', label: '#' },
-    { k: 'code', label: '代码', sort: 'c' },
-    { k: 'name', label: '名称', sort: 'n' },
-    { k: 'price', label: '最新价', sort: 'p', num: true },
-    { k: 'zdp', label: '涨跌幅', sort: 'zdp', num: true },
-    { k: 'days', label: '跌停天数', sort: 'days', num: true },
-    { k: 'fund', label: '封单资金', sort: 'fund', num: true },
-    { k: 'lbt', label: '封板时间', sort: 'lbt' },
-    { k: 'hs', label: '换手率', sort: 'hs', num: true },
-    { k: 'amount', label: '成交额', sort: 'amount', num: true },
-    { k: 'hybk', label: '行业', sort: 'hybk' }
-  ],
-  qs: [
-    { k: 'idx', label: '#' },
-    { k: 'code', label: '代码', sort: 'c' },
-    { k: 'name', label: '名称', sort: 'n' },
-    { k: 'price', label: '最新价', sort: 'p', num: true },
-    { k: 'zdp', label: '涨跌幅', sort: 'zdp', num: true },
-    { k: 'ztp', label: '涨停价', sort: 'ztp', num: true },
-    { k: 'hs', label: '换手率', sort: 'hs', num: true },
-    { k: 'lb', label: '量比', sort: 'lb', num: true },
-    { k: 'zs', label: '涨速', sort: 'zs', num: true },
-    { k: 'nh', label: '新高', sort: 'nh' },
-    { k: 'zttj', label: '涨停统计', sort: 'zttj' },
-    { k: 'cc', label: '入选理由', sort: 'cc' },
-    { k: 'amount', label: '成交额', sort: 'amount', num: true },
-    { k: 'ltsz', label: '流通市值', sort: 'ltsz', num: true },
-    { k: 'hybk', label: '行业', sort: 'hybk' }
-  ]
-};
+/* 若所选日期无数据（周末/节假日），回退到最近交易日 */
+async function resolveDate(date) {
+  let d = date;
+  for (let i = 0; i < 12; i++) {
+    const pool = await fetchThsPool(d);
+    if (pool.length) return { date: d, pool };
+    d = shiftDay(d, -1);
+  }
+  return null;
+}
 
-const state = {
-  date: '',
-  tab: 'zt',
-  data: { zt: [], zb: [], dt: [], qs: [] },
-  filters: { search: '', lbc: 'all', industry: '' },
-  sort: { key: 'fbt', dir: 1 },
-  prevZt: null,
-  auto: true,
-  followLatest: true,
-  lastUpdate: null,
-  qsError: false
-};
+/* ---------------------------- load day ---------------------------- */
+async function loadDay(date, opts = {}) {
+  if (S.loading) return;
+  S.loading = true;
+  setLoading(true);
+  setStatus('正在加载…', '');
+  try {
+    const resolved = await resolveDate(date);
+    if (!resolved) throw new Error('未找到可用的交易日数据');
+    const useDate = resolved.date;
+    S.date = useDate;
+    $('#dateInput').value = `${useDate.slice(0, 4)}-${useDate.slice(4, 6)}-${useDate.slice(6, 8)}`;
+    S.latestDate = useDate;
 
-let latestDate = null;
-let isOnLatest = false;
-let refreshTimer = null;
-let nextRefreshAt = 0;
+    const zt = resolved.pool;
+    const [zb, dt, blocks, prevInfo] = await Promise.all([
+      fetchEmPool('zb', useDate).catch(() => []),
+      fetchEmPool('dt', useDate).catch(() => []),
+      fetchThsBlocks(useDate).catch(() => []),
+      resolvePrevDate(useDate),
+    ]);
 
-const $ = (id) => document.getElementById(id);
-const dateInput = $('dateInput');
-const tabsEl = $('tabs');
-const cardsEl = $('cards');
-const summaryEl = $('summaryText');
-const chartLb = $('chartLb');
-const chartTime = $('chartTime');
-const chartInd = $('chartInd');
-const theadEl = $('thead');
-const tbodyEl = $('tbody');
-const searchEl = $('search');
-const lbcEl = $('lbcFilter');
-const indEl = $('industryFilter');
-const tableFootEl = $('tableFoot');
-const loadingEl = $('loading');
-const toastEl = $('toast');
-const statusText = $('statusText');
-const countdownEl = $('countdown');
-const liveDot = $('liveDot');
-const pauseBtn = $('pauseBtn');
-const followLatestEl = $('followLatest');
-const auctionStats = $('auctionStats');
-const auctionTable = $('auctionTable');
-const auctionZbNote = $('auctionZbNote');
-const ladderStats = $('ladderStats');
-const ladderList = $('ladderList');
-const chartModal = $('chartModal');
-const modalTitle = $('modalTitle');
-const modalClose = $('modalClose');
-const chartIntra = $('chartIntra');
-const chartKline = $('chartKline');
-const boardTabs = $('boardTabs');
-const boardType = $('boardType');
-const boardSearch = $('boardSearch');
-const boardBody = $('boardBody');
-const boardSummary = $('boardSummary');
-const strongSearch = $('strongSearch');
-const strongStats = $('strongStats');
-const strongBody = $('strongBody');
+    const allCodes = [...zt.map((s) => s.code), ...zb.map((s) => s.code), ...dt.map((s) => s.code), ...prevInfo.pool.map((s) => s.code)];
+    const quotes = await fetchQuotes(allCodes).catch(() => new Map());
 
-/* ---------- utils ---------- */
-function pad(n) { return n < 10 ? '0' + n : '' + n; }
-function todayStr() { const d = new Date(); return '' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()); }
-function parseYmd(s) { return new Date(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8)); }
-function fmtYmd(d) { return '' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()); }
-function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
-function toInput(s) { return s.slice(0, 4) + '-' + s.slice(4, 6) + '-' + s.slice(6, 8); }
-const CN_WEEK = ['日', '一', '二', '三', '四', '五', '六'];
-function fmtWeek(s) { return '周' + CN_WEEK[parseYmd(s).getDay()]; }
+    S.quotes = quotes;
+    S.day = { zt, zb, dt, prev: prevInfo.pool, prevDate: prevInfo.date, blocks };
+
+    // 代码 -> 所属板块
+    const meta = new Map();
+    const sortedBlocks = [...blocks].sort((a, b) => b.zt - a.zt);
+    for (const b of sortedBlocks) {
+      for (const s of b.stocks) {
+        if (!meta.has(s.code)) meta.set(s.code, []);
+        meta.get(s.code).push(b.name);
+      }
+    }
+    S.blockMeta = meta;
+
+    S.minute.clear();
+    S.boardCurves = null;
+    if (!S.boardSel.size) {
+      sortedBlocks.slice(0, 6).forEach((b) => S.boardSel.add(b.name));
+    } else {
+      const names = new Set(blocks.map((b) => b.name));
+      for (const n of Array.from(S.boardSel)) if (!names.has(n)) S.boardSel.delete(n);
+      if (!S.boardSel.size) sortedBlocks.slice(0, 6).forEach((b) => S.boardSel.add(b.name));
+    }
+
+    renderAll();
+    const t = new Date();
+    const hm = `${pad2(t.getHours())}:${pad2(t.getMinutes())}:${pad2(t.getSeconds())}`;
+    S.lastUpdate = hm;
+    setStatus(`已更新 ${hm}`, 'live');
+  } catch (e) {
+    console.error(e);
+    setStatus('加载失败：' + (e.message || e), 'err');
+    toast('数据加载失败：' + (e.message || e));
+  } finally {
+    S.loading = false;
+    setLoading(false);
+  }
+}
+
+function setLoading(on) { $('#loading').classList.toggle('on', on); }
+function setStatus(text, cls) {
+  $('#statusText').textContent = text;
+  const dot = $('#liveDot');
+  dot.className = 'dot' + (cls ? ' ' + cls : '');
+}
+let toastTimer = null;
+function toast(msg) {
+  const el = $('#toast');
+  el.textContent = msg;
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), 2600);
+}
+
+/* ---------------------------- derived ---------------------------- */
+function todayMap() { return new Map(S.day.zt.map((s) => [s.code, s])); }
+function zbMap() { return new Map(S.day.zb.map((s) => [s.code, s])); }
+function q(code) { return S.quotes.get(code) || null; }
+function chgOf(code, fallback) {
+  const v = q(code);
+  if (v && v.chg != null) return v.chg;
+  return fallback != null ? fallback : null;
+}
+function blockTags(code, limit = 1) {
+  const arr = S.blockMeta.get(code);
+  if (arr && arr.length) return arr.slice(0, limit);
+  const s = todayMap().get(code);
+  if (s && s.reason) return s.reason.split('+').slice(0, limit);
+  return [];
+}
+function maxLevel() {
+  let m = 1;
+  for (const s of S.day.zt) m = Math.max(m, s.level || 1);
+  return m;
+}
+
+/* ---------------------------- render ---------------------------- */
+function renderAll() {
+  renderStats();
+  renderChips();
+  renderLadder();
+  renderSector();
+  renderList();
+}
+
+function renderStats() {
+  if (!S.day) return;
+  const { zt, zb, dt, prev } = S.day;
+  const tMap = todayMap();
+  const totalPrev = prev.length;
+  let promoted = 0;
+  for (const s of prev) if (tMap.has(s.code)) promoted++;
+  const rate = totalPrev ? (promoted / totalPrev) * 100 : 0;
+  const sealRate = zt.length + zb.length ? (zt.length / (zt.length + zb.length)) * 100 : 0;
+  const maxLv = maxLevel();
+  const maxLvCount = zt.filter((s) => s.level === maxLv).length;
+  const maxLvName = zt.filter((s) => s.level === maxLv).map((s) => s.name).slice(0, 1).join('');
+
+  const items = [
+    { k: '涨停家数', v: zt.length, cls: 'up', s: `昨 ${prev.length} 家` },
+    { k: '炸板家数', v: zb.length, cls: '', s: `封板率 ${sealRate.toFixed(1)}%` },
+    { k: '跌停家数', v: dt.length, cls: 'down', s: dt.length ? '注意风险' : '无跌停' },
+    { k: '最高连板', v: maxLv + ' 板', cls: 'accent', s: `${maxLvCount} 家 · ${maxLvName || '—'}` },
+    { k: '昨日晋级率', v: promoted + '/' + totalPrev, cls: '', s: `${rate.toFixed(1)}%` },
+    { k: '板块热点', v: (S.day.blocks[0] ? S.day.blocks[0].zt : 0) + ' 家', cls: 'up', s: S.day.blocks[0] ? S.day.blocks[0].name : '—' },
+  ];
+  $('#stats').innerHTML = items.map((it) => `
+    <div class="stat ${it.cls}">
+      <div class="k">${it.k}</div>
+      <div class="v">${it.v}</div>
+      <div class="s">${it.s}</div>
+    </div>`).join('');
+}
+
+function renderChips() {
+  if (!S.day) return;
+  const blocks = S.day.blocks;
+  const total = S.day.zt.length;
+  const html = [`<button class="chip ${S.chip ? '' : 'on'}" data-chip="">全部 <span class="n">${total}</span></button>`];
+  for (const b of blocks.slice(0, 24)) {
+    html.push(`<button class="chip ${S.chip === b.name ? 'on' : ''}" data-chip="${esc(b.name)}">${esc(b.name)} <span class="n">${b.zt}</span></button>`);
+  }
+  $('#chips').innerHTML = html.join('');
+}
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
-function fmtPrice(v) { return v == null || isNaN(v) ? '—' : (v / 1000).toFixed(2); }
-function fmtPct(v) { return v == null || isNaN(v) ? '—' : (+v).toFixed(2) + '%'; }
-function fmtMoney(v) {
-  if (v == null || isNaN(v)) return '—';
-  const n = +v, abs = Math.abs(n);
-  if (abs >= 1e8) return (n / 1e8).toFixed(2) + '亿';
-  if (abs >= 1e4) return (n / 1e4).toFixed(2) + '万';
-  return n.toFixed(0);
-}
-function fmtTime(v) {
-  if (v == null || v === '') return '—';
-  const s = String(v).padStart(6, '0');
-  return s.slice(0, 2) + ':' + s.slice(2, 4) + ':' + s.slice(4, 6);
-}
-function fmtZttj(z) { if (!z || !z.days) return '—'; return z.days + '天' + z.ct + '板'; }
-function pclass(v) { return +v > 0 ? 'up' : (+v < 0 ? 'down' : ''); }
+const RULES = {
+  hot: (a, b) => (rank(a) - rank(b)) || (b.chg - a.chg),
+  chg: (a, b) => (b.chg ?? -999) - (a.chg ?? -999),
+  first: (a, b) => (a.first || 9e9) - (b.first || 9e9),
+  open: (a, b) => (b.openNum || 0) - (a.openNum || 0),
+  order: (a, b) => (b.orderAmt || 0) - (a.orderAmt || 0),
+  amount: (a, b) => (b.amount || 0) - (a.amount || 0),
+  cap: (a, b) => (a.flowCap || 9e12) - (b.flowCap || 9e12),
+  turnover: (a, b) => (b.turnover || 0) - (a.turnover || 0),
+};
+function rank(x) { return x.status === 'up' ? 0 : x.status === 'boom' ? 1 : 2; }
 
-function lbcBadge(l) {
-  if (!l) return '—';
-  if (l >= 5) return '<span class="badge b5">' + l + '板</span>';
-  if (l >= 3) return '<span class="badge b3">' + l + '板</span>';
-  if (l >= 2) return '<span class="badge b2">' + l + '板</span>';
-  return '<span class="badge b1">首板</span>';
-}
-
-function fbtBucket(t) {
-  const v = +t || 0;
-  for (let i = 0; i < TIME_BUCKETS.length; i++) {
-    const b = TIME_BUCKETS[i];
-    if (v >= b.from && v <= b.to) return i;
-  }
-  return -1;
-}
-
-function countBy(arr) {
-  const m = {};
-  arr.forEach((k) => { m[k] = (m[k] || 0) + 1; });
-  return m;
-}
-
-/* ---------- JSONP ---------- */
-let cbCounter = 0;
-function jsonp(url, timeout = 15000) {
-  return new Promise((resolve, reject) => {
-    const name = '__ztp_cb_' + (cbCounter++);
-    const script = document.createElement('script');
-    let settled = false;
-    const timer = setTimeout(() => { if (!settled) { settled = true; cleanup(); reject(new Error('请求超时')); } }, timeout);
-    function cleanup() { delete window[name]; if (script.parentNode) script.parentNode.removeChild(script); clearTimeout(timer); }
-    window[name] = (payload) => { if (settled) return; settled = true; cleanup(); resolve(payload); };
-    script.onerror = () => { if (settled) return; settled = true; cleanup(); reject(new Error('网络请求失败')); };
-    script.src = url + (url.indexOf('?') >= 0 ? '&' : '?') + 'cb=' + name;
-    document.head.appendChild(script);
+function buildItems(codes, srcMap) {
+  const tMap = todayMap();
+  const zMap = zbMap();
+  return codes.map((code) => {
+    const prevS = srcMap.get(code);
+    const t = tMap.get(code);
+    const z = zMap.get(code);
+    const status = t ? 'up' : z ? 'boom' : 'fail';
+    const live = q(code);
+    const base = t || z || prevS || {};
+    return {
+      code,
+      name: base.name || code,
+      status,
+      chg: chgOf(code, base.chg),
+      first: t ? t.first : z ? z.first : 0,
+      openNum: t ? t.openNum : z ? z.openNum : 0,
+      orderAmt: t ? t.orderAmt : 0,
+      amount: live ? live.amt : (z ? z.amount : 0),
+      turnover: live ? live.turnover : (base.turnover || 0),
+      flowCap: live ? live.flowCap : (base.flowCap || 0),
+      level: prevS ? prevS.level : (t ? t.level : 1),
+    };
   });
-}
-
-async function fetchPool(kind, date) {
-  const sort = kind === 'dt' ? 'fund:asc' : 'fbt:asc';
-  const list = [];
-  let qdate = null;
-  for (let page = 0; page < 20; page++) {
-    const url = BASE + EP[kind] + '?ut=' + UT + '&dpt=' + DPT + '&Pageindex=' + page + '&pagesize=500&sort=' + encodeURIComponent(sort) + '&date=' + date;
-    const res = await jsonp(url);
-    const d = res && res.data;
-    if (page === 0) qdate = d && d.qdate ? String(d.qdate) : null;
-    if (!d || !Array.isArray(d.pool) || d.pool.length === 0) break;
-    list.push.apply(list, d.pool);
-    if (list.length >= (d.tc || 0)) break;
-  }
-  return { list: list, qdate: qdate };
-}
-
-async function fetchStrongPool(date) {
-  const list = [];
-  for (let page = 0; page < 20; page++) {
-    const url = BASE + 'getTopicQSPool?ut=' + UT + '&dpt=' + DPT + '&Pageindex=' + page + '&pagesize=500&sort=' + encodeURIComponent('zdp:desc') + '&date=' + date;
-    const res = await jsonp(url);
-    const d = res && res.data;
-    if (!d || !Array.isArray(d.pool) || d.pool.length === 0) break;
-    list.push.apply(list, d.pool);
-    if (list.length >= (d.tc || 0)) break;
-  }
-  return list;
-}
-
-/* ---------- loading / toast ---------- */
-function setLoading(on) { loadingEl.classList.toggle('show', !!on); }
-let toastTimer;
-function toast(msg) {
-  toastEl.textContent = msg;
-  toastEl.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 3200);
-}
-
-/* ---------- auto refresh scheduler ---------- */
-function bjNow() {
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone: 'Asia/Shanghai', hour12: false, hourCycle: 'h23',
-    weekday: 'short', hour: '2-digit', minute: '2-digit', second: '2-digit'
-  });
-  const parts = {};
-  fmt.formatToParts(new Date()).forEach((p) => { parts[p.type] = p.value; });
-  return { hour: (+parts.hour) % 24, minute: +parts.minute, second: +parts.second, weekday: parts.weekday };
-}
-
-function isTradingHours() {
-  const p = bjNow();
-  if (p.weekday === 'Sat' || p.weekday === 'Sun') return false;
-  const t = p.hour * 60 + p.minute;
-  return (t >= 555 && t <= 690) || (t >= 780 && t <= 905);
-}
-
-function refreshInterval() { return isTradingHours() ? 30 : 300; }
-
-function scheduleRefresh() {
-  clearTimeout(refreshTimer);
-  const sec = refreshInterval();
-  nextRefreshAt = Date.now() + sec * 1000;
-  refreshTimer = setTimeout(() => { autoTick(); }, sec * 1000);
-}
-
-function updateStatus() {
-  if (!state.auto) {
-    liveDot.className = 'live-dot off';
-    statusText.textContent = '自动刷新已暂停';
-    countdownEl.textContent = '';
-    return;
-  }
-  liveDot.className = 'live-dot on';
-  const last = state.lastUpdate ? state.lastUpdate.toTimeString().slice(0, 8) : '—';
-  statusText.textContent = '实时更新中 · 最后更新 ' + last;
-  const remain = Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000));
-  countdownEl.textContent = '下次刷新 ' + remain + 's';
-}
-
-async function autoTick() {
-  if (!state.auto) return;
-  try {
-    saveScrolls();
-    if (state.followLatest && isOnLatest && !isTradingHours()) {
-      const probe = await fetchPool('zt', '20991231');
-      const qd = probe.qdate || state.date;
-      if (Number(qd) > Number(state.date)) {
-        latestDate = qd;
-        await applyDay(qd, { silent: true, skipPrev: true });
-      } else {
-        await applyDay(state.date, { silent: true, skipPrev: true });
-      }
-    } else {
-      await applyDay(state.date, { silent: true, skipPrev: true });
-    }
-    state.lastUpdate = new Date();
-    updateStatus();
-  } catch (e) {
-    statusText.textContent = '更新失败：' + e.message;
-  }
-  if (state.auto) scheduleRefresh();
-}
-
-/* ---------- rendering ---------- */
-function setDefaultSort(tab) { state.sort = tab === 'dt' ? { key: 'days', dir: -1 } : { key: 'fbt', dir: 1 }; }
-
-// 自动/手动刷新重新渲染时，保留表格内部滚动位置，避免用户浏览时被“拽回顶部”。
-// 板块/强势股表格是异步重建的，因此在每次重建后按槽位恢复并“消费”一次。
-let pendingScroll = null;
-function saveScrolls() {
-  const t = document.querySelector('.table-wrap');
-  const b = document.querySelector('#boardBody .board-table-wrap');
-  const s = document.querySelector('#strongBody .board-table-wrap');
-  pendingScroll = {
-    table: t ? { el: t, top: t.scrollTop, left: t.scrollLeft } : null,
-    board: b ? { el: b, top: b.scrollTop, left: b.scrollLeft } : null,
-    strong: s ? { el: s, top: s.scrollTop, left: s.scrollLeft } : null
-  };
-}
-function restoreScrolls() {
-  if (!pendingScroll) return;
-  const p = pendingScroll;
-  const fix = function (slot, sel) {
-    const info = p[slot];
-    if (!info) return;
-    const cur = document.querySelector(sel);
-    if (!cur) return;               // 容器当前不存在（如精选模式/空态），留给后续渲染
-    if (cur !== info.el) {          // 容器已重建才恢复并消费；仍是旧元素说明异步数据未到
-      cur.scrollTop = info.top;
-      cur.scrollLeft = info.left;
-      p[slot] = null;
-    }
-  };
-  fix('table', '.table-wrap');
-  fix('board', '#boardBody .board-table-wrap');
-  fix('strong', '#strongBody .board-table-wrap');
-}
-
-function renderAll(opts) {
-  opts = opts || {};
-  $('cntZt').textContent = state.data.zt.length;
-  $('cntZb').textContent = state.data.zb.length;
-  $('cntDt').textContent = state.data.dt.length;
-  renderCards();
-  renderSummary();
-  renderAuction();
-  renderLadder();
-  renderCharts();
-  renderIndustryOptions();
-  renderTable();
-  renderBoards();
-  renderStrongPool();
-  restoreScrolls();
-  if (!opts.skipPrev) refreshPrevDelta();
-}
-
-function renderCards() {
-  const zt = state.data.zt, zb = state.data.zb, dt = state.data.dt;
-  const n = zt.length;
-  const maxLbc = n ? Math.max.apply(null, zt.map((s) => s.lbc || 0)) : 0;
-  const lianban = zt.filter((s) => (s.lbc || 0) >= 2).length;
-  const sealed = n + zb.length;
-  const sealRate = sealed ? n / sealed * 100 : null;
-  const zhaRate = sealed ? zb.length / sealed * 100 : null;
-  const first = n - lianban;
-  const jinRate = n ? lianban / n * 100 : null;
-
-  let deltaHtml = '<span class="sub muted">较上一交易日 —</span>';
-  if (state.prevZt != null) {
-    const d = n - state.prevZt;
-    if (d > 0) deltaHtml = '<span class="sub up">较上一交易日 +' + d + '</span>';
-    else if (d < 0) deltaHtml = '<span class="sub down">较上一交易日 ' + d + '</span>';
-    else deltaHtml = '<span class="sub muted">较上一交易日 平</span>';
-  }
-
-  cardsEl.innerHTML =
-    '<div class="card"><div class="k">涨停家数</div><div class="v up">' + n + '</div>' + deltaHtml + '</div>' +
-    '<div class="card"><div class="k">炸板家数</div><div class="v warn">' + zb.length + '</div><div class="sub muted">炸板率 ' + fmtPct(zhaRate) + '</div></div>' +
-    '<div class="card"><div class="k">跌停家数</div><div class="v down">' + dt.length + '</div><div class="sub muted">风险观察</div></div>' +
-    '<div class="card"><div class="k">最高连板</div><div class="v up">' + maxLbc + '板</div><div class="sub muted">连板股 ' + lianban + ' 家</div></div>' +
-    '<div class="card"><div class="k">封板率</div><div class="v">' + fmtPct(sealRate) + '</div><div class="sub muted">' + n + '/' + sealed + ' 封住</div></div>' +
-    '<div class="card"><div class="k">首板家数</div><div class="v">' + first + '</div><div class="sub muted">晋级率 ' + fmtPct(jinRate) + '</div></div>';
-}
-
-function renderSummary() {
-  const zt = state.data.zt, zb = state.data.zb, dt = state.data.dt;
-  if (!zt.length && !zb.length && !dt.length) {
-    summaryEl.textContent = '该日期无涨停 / 炸板 / 跌停数据（可能为非交易日）。可点击“今天”返回最新交易日。';
-    return;
-  }
-  const maxLbc = Math.max.apply(null, zt.map((s) => s.lbc || 0).concat([0]));
-  const lianban = zt.filter((s) => (s.lbc || 0) >= 2).length;
-  const sealed = zt.length + zb.length;
-  const sealRate = sealed ? zt.length / sealed * 100 : 0;
-  const zhaRate = sealed ? zb.length / sealed * 100 : 0;
-
-  const tCounts = TIME_BUCKETS.map(() => 0);
-  zt.forEach((s) => { const b = fbtBucket(s.fbt); if (b >= 0) tCounts[b]++; });
-  let peakI = 0;
-  tCounts.forEach((c, i) => { if (c > tCounts[peakI]) peakI = i; });
-
-  const ind = countBy(zt.map((s) => s.hybk || '其他'));
-  const top = Object.entries(ind).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => k + '（' + v + '家）').join('、') || '—';
-
-  summaryEl.textContent =
-    toInput(state.date) + ' ' + fmtWeek(state.date) + '：' +
-    '涨停 ' + zt.length + ' 家，炸板 ' + zb.length + ' 家，跌停 ' + dt.length + ' 家。' +
-    '最高连板 ' + maxLbc + ' 板，连板股 ' + lianban + ' 家。' +
-    '封板率 ' + sealRate.toFixed(1) + '%（' + zt.length + '/' + sealed + '），炸板率 ' + zhaRate.toFixed(1) + '%。' +
-    '封板集中在 ' + TIME_BUCKETS[peakI].label + '（' + tCounts[peakI] + ' 家）。' +
-    '热点行业：' + top + '。' +
-    '数据仅供复盘参考，不构成投资建议。';
-}
-
-/* ---------- auction & ladder ---------- */
-function renderAuction() {
-  const zt = state.data.zt, zb = state.data.zb;
-  const jy = zt.filter((s) => s.fbt != null && +s.fbt <= 92500);
-  const jyZb = zb.filter((s) => s.fbt != null && +s.fbt <= 92500);
-  const pct = zt.length ? jy.length / zt.length * 100 : 0;
-  const fundSum = jy.reduce((a, s) => a + (+s.fund || 0), 0);
-
-  auctionStats.innerHTML =
-    '<span class="stat-chip">竞价涨停 <b>' + jy.length + '</b> 家</span>' +
-    '<span class="stat-chip">占全部涨停 <b>' + pct.toFixed(1) + '%</b></span>' +
-    '<span class="stat-chip">竞价封单合计 <b>' + fmtMoney(fundSum) + '</b></span>' +
-    '<span class="stat-chip">竞价涨停后炸板 <b class="warn">' + jyZb.length + '</b> 家</span>';
-
-  if (!jy.length) {
-    auctionTable.innerHTML = '<div class="empty-note">今日暂无竞价涨停（集合竞价阶段未封板或数据尚未生成）</div>';
-  } else {
-    const head = '<thead><tr><th class="l">代码</th><th class="l">名称</th><th class="num">现价</th><th class="num">涨跌幅</th><th class="num">连板</th><th class="num">封单资金</th><th class="l">行业</th></tr></thead>';
-    const body = '<tbody>' + jy.map((s) =>
-      '<tr><td class="l code">' + s.c + '</td>' +
-      '<td class="l name">' + esc(s.n) + '</td>' +
-      '<td class="num ' + pclass(s.zdp) + '">' + fmtPrice(s.p) + '</td>' +
-      '<td class="num ' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</td>' +
-      '<td class="num">' + lbcBadge(s.lbc) + '</td>' +
-      '<td class="num">' + fmtMoney(s.fund) + '</td>' +
-      '<td class="l muted">' + esc(s.hybk || '—') + '</td></tr>'
-    ).join('') + '</tbody>';
-    auctionTable.innerHTML = '<table>' + head + body + '</table>';
-  }
-
-  auctionZbNote.innerHTML = jyZb.length
-    ? '竞价涨停后炸板：' + jyZb.map((s) => esc(s.n) + '(' + s.c + ')').join('、')
-    : '';
 }
 
 function renderLadder() {
-  const zt = state.data.zt;
-  const ladder = {};
-  zt.forEach((s) => { const l = Math.max(1, s.lbc || 0); (ladder[l] = ladder[l] || []).push(s); });
-  const heights = Object.keys(ladder).map(Number).filter((l) => l >= 2).sort((a, b) => b - a);
-  const lianban = zt.filter((s) => (s.lbc || 0) >= 2).length;
-  const maxLbc = heights[0] || 0;
-  const prev = state.prevZt;
-  let jin = '—';
-  if (prev) jin = lianban + '/' + prev + '（' + (lianban / prev * 100).toFixed(1) + '%）';
-  ladderStats.textContent = '最高 ' + maxLbc + ' 板 · 连板 ' + lianban + ' 家 · 昨日涨停晋级 ' + jin;
+  if (!S.day) return;
+  const { zt, prev } = S.day;
+  const chipSet = S.chip ? memberSet(S.chip) : null;
+  const groups = new Map();
+  for (const s of prev) {
+    const lv = s.level || 1;
+    if (!groups.has(lv)) groups.set(lv, []);
+    groups.get(lv).push(s.code);
+  }
+  const srcMap = new Map(prev.map((s) => [s.code, s]));
+  const rows = [];
+  const maxLv = Math.max(...groups.keys(), 1);
 
-  if (!zt.length) {
-    ladderList.innerHTML = '<div class="muted first-note">暂无涨停数据</div>';
-    return;
+  for (let lv = maxLv; lv >= 1; lv--) {
+    let codes = groups.get(lv) || [];
+    if (chipSet) codes = codes.filter((c) => chipSet.has(c));
+    if (!codes.length) continue;
+    const items = buildItems(codes, srcMap);
+    const succ = items.filter((i) => i.status === 'up').length;
+    items.sort(RULES[S.rule] || RULES.hot);
+    rows.push(rowHtml(`${lv}进${lv + 1}`, `${succ}/${items.length}`, items.length ? (succ / items.length) * 100 : 0, items));
   }
 
-  let html = '';
-  heights.forEach((h) => {
-    const stocks = (ladder[h] || []).slice().sort((a, b) => (+b.fund || 0) - (+a.fund || 0));
-    const chips = stocks.map((s) =>
-      '<span class="stock-chip" data-code="' + esc(s.c) + '" title="' + esc(s.n) + ' 封单 ' + fmtMoney(s.fund) + ' · ' + esc(s.hybk || '') + '">' +
-      esc(s.n) + '<span class="c">' + s.c + '</span></span>'
-    ).join('');
-    const tagCls = h >= 5 ? 'tag-5' : (h >= 3 ? 'tag-3' : 'tag-2');
-    html += '<div class="ladder-row"><div class="ladder-tag ' + tagCls + '">' + h + '板</div><div class="ladder-stocks">' + chips + '</div></div>';
-  });
-  const firstN = (ladder[1] || []).length;
-  html += '<div class="ladder-row"><div class="ladder-tag tag-1">首板</div><div class="ladder-stocks"><span class="muted first-note">' + firstN + ' 家（见下方涨停板表格）</span></div></div>';
-  ladderList.innerHTML = html;
-}
-
-/* ---------- stock chart modal ---------- */
-let modalStock = null;
-let modalTimer = null;
-
-function txCode(s) {
-  const c = String(s.c);
-  if (c[0] === '6') return 'sh' + c;
-  if (c[0] === '4' || c[0] === '8' || c.slice(0, 3) === '920') return 'bj' + c;
-  return 'sz' + c;
-}
-
-async function fetchJson(url, timeout = 10000) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeout);
-  try {
-    const res = await fetch(url, { signal: ctrl.signal });
-    if (!res.ok) throw new Error('请求失败 ' + res.status);
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-async function fetchTrend(s) {
-  const code = txCode(s);
-  const j = await fetchJson('https://web.ifzq.gtimg.cn/appstock/app/minute/query?code=' + code);
-  const node = j && j.data && j.data[code];
-  const qt = node && node.qt && node.qt[code];
-  const arr = node && node.data && node.data.data;
-  if (!arr || !arr.length) throw new Error('无分时数据');
-  const preClose = parseFloat(qt && qt[4]);
-  const points = arr.map(function (it) {
-    const p = String(it).split(' ');
-    const t = String(p[0] || '');
-    return { t: t.slice(0, 2) + ':' + t.slice(2), price: parseFloat(p[1]) };
-  }).filter(function (p) { return isFinite(p.price); });
-  return { preClose: preClose, points: points };
-}
-
-async function fetchKline(s, date) {
-  const code = txCode(s);
-  const end = toInput(fmtYmd(addDays(parseYmd(date), 1)));
-  const j = await fetchJson('https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param=' + code + ',day,2000-01-01,' + end + ',90,qfq');
-  const node = j && j.data && j.data[code];
-  const arr = (node && (node.qfqday || node.day)) || [];
-  if (!arr || !arr.length) throw new Error('无K线数据');
-  return arr.map(function (it) {
-    return { date: it[0], o: parseFloat(it[1]), c: parseFloat(it[2]), h: parseFloat(it[3]), l: parseFloat(it[4]) };
-  }).filter(function (x) { return isFinite(x.c); }).slice(-60);
-}
-
-function drawNote(canvas, text) {
-  const g = setupCanvas(canvas, 250);
-  g.ctx.clearRect(0, 0, g.W, g.H);
-  g.ctx.fillStyle = '#7a8699';
-  g.ctx.font = '12px sans-serif';
-  g.ctx.textAlign = 'center';
-  g.ctx.fillText(text, g.W / 2, g.H / 2);
-}
-
-function drawIntraday(canvas, preClose, points) {
-  const H = 250;
-  const g = setupCanvas(canvas, H);
-  const ctx = g.ctx, W = g.W;
-  ctx.clearRect(0, 0, W, H);
-  if (!points.length) { emptyChart(ctx, W, H); return; }
-  const padL = 48, padR = 12, padT = 12, padB = 24;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  let minP = preClose, maxP = preClose;
-  points.forEach(function (p) { if (p.price < minP) minP = p.price; if (p.price > maxP) maxP = p.price; });
-  if (maxP === minP) { maxP += 0.01; minP -= 0.01; }
-  let range = maxP - minP;
-  minP -= range * 0.06; maxP += range * 0.06;
-  range = maxP - minP;
-  function yOf(v) { return padT + plotH * (maxP - v) / range; }
-
-  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
-  ctx.fillStyle = '#7a8699';
-  ctx.font = '11px sans-serif';
-  ctx.textAlign = 'left';
-  for (let i = 0; i <= 4; i++) {
-    const v = maxP - range * i / 4;
-    const y = yOf(v);
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    ctx.fillText(v.toFixed(2), 4, y + 4);
+  // 首板行 = 今日首板
+  let first = zt.filter((s) => (s.level || 1) === 1);
+  if (chipSet) first = first.filter((s) => chipSet.has(s.code));
+  if (first.length) {
+    const items = buildItems(first.map((s) => s.code), new Map(first.map((s) => [s.code, s])));
+    items.sort(RULES[S.rule] || RULES.hot);
+    const totalToday = zt.length;
+    const pct = totalToday ? (items.length / totalToday) * 100 : 0;
+    rows.push(rowHtml('首板', `${items.length}/${totalToday}`, pct, items));
   }
 
-  const ypc = yOf(preClose);
-  ctx.strokeStyle = '#a9b4c4';
-  ctx.setLineDash([4, 4]);
-  ctx.beginPath(); ctx.moveTo(padL, ypc); ctx.lineTo(W - padR, ypc); ctx.stroke();
-  ctx.setLineDash([]);
-  ctx.fillText('昨收 ' + preClose.toFixed(2), 4, ypc - 3);
-
-  const n = points.length;
-  const last = points[n - 1].price;
-  const color = last >= preClose ? '#ff6a6a' : '#57d25c';
-  const xs = points.map(function (p, i) { return padL + plotW * i / Math.max(1, n - 1); });
-  ctx.beginPath();
-  points.forEach(function (p, i) {
-    const x = xs[i], y = yOf(p.price);
-    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-  });
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1.4;
-  ctx.stroke();
-
-  ctx.beginPath();
-  ctx.moveTo(xs[0], yOf(points[0].price));
-  for (let i = 1; i < n; i++) ctx.lineTo(xs[i], yOf(points[i].price));
-  ctx.lineTo(xs[n - 1], ypc);
-  ctx.lineTo(xs[0], ypc);
-  ctx.closePath();
-  const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
-  grad.addColorStop(0, color + '2e');
-  grad.addColorStop(1, color + '00');
-  ctx.fillStyle = grad;
-  ctx.fill();
-
-  ctx.fillStyle = '#7a8699';
-  ctx.textAlign = 'center';
-  [[0, '09:30'], [0.25, '10:30'], [0.5, '11:30/13:00'], [0.75, '14:00'], [1, '15:00']].forEach(function (lb) {
-    ctx.fillText(lb[1], padL + plotW * lb[0], H - 6);
-  });
+  $('#ladder').innerHTML = rows.join('') || '<div class="empty">该板块今日无涨停</div>';
 }
 
-function drawKlineChart(canvas, kl) {
-  const H = 250;
-  const g = setupCanvas(canvas, H);
-  const ctx = g.ctx, W = g.W;
-  ctx.clearRect(0, 0, W, H);
-  if (!kl.length) { emptyChart(ctx, W, H); return; }
-  const padL = 48, padR = 12, padT = 12, padB = 24;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  let minL = Infinity, maxH = -Infinity;
-  kl.forEach(function (k) { if (k.l < minL) minL = k.l; if (k.h > maxH) maxH = k.h; });
-  if (!isFinite(minL) || !isFinite(maxH)) { emptyChart(ctx, W, H); return; }
-  let range = maxH - minL || 1;
-  minL -= range * 0.06; maxH += range * 0.06;
-  range = maxH - minL;
-  function yOf(v) { return padT + plotH * (maxH - v) / range; }
-
-  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
-  ctx.fillStyle = '#7a8699';
-  ctx.font = '11px sans-serif';
-  ctx.textAlign = 'left';
-  for (let i = 0; i <= 4; i++) {
-    const v = maxH - range * i / 4;
-    const y = yOf(v);
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    ctx.fillText(v.toFixed(2), 4, y + 4);
-  }
-
-  const n = kl.length;
-  const step = plotW / n;
-  const bw = Math.max(2, Math.min(11, step * 0.7));
-  kl.forEach(function (k, i) {
-    const x = padL + step * (i + 0.5);
-    const up = k.c >= k.o;
-    const color = up ? '#ff6a6a' : '#57d25c';
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.moveTo(x, yOf(k.h)); ctx.lineTo(x, yOf(k.l)); ctx.stroke();
-    const yTop = yOf(Math.max(k.o, k.c));
-    const yBot = yOf(Math.min(k.o, k.c));
-    const bh = Math.max(1, yBot - yTop);
-    ctx.fillStyle = color;
-    roundRect(ctx, x - bw / 2, yTop, bw, bh, 1);
-    ctx.fill();
-  });
-
-  ctx.fillStyle = '#7a8699';
-  ctx.textAlign = 'center';
-  [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i) {
-    ctx.fillText(String(kl[i].date).slice(5), padL + step * (i + 0.5), H - 6);
-  });
+function memberSet(name) {
+  const b = S.day.blocks.find((x) => x.name === name);
+  return b ? new Set(b.stocks.map((s) => s.code)) : new Set();
 }
 
-async function refreshModalChart() {
-  if (!modalStock) return;
-  drawNote(chartIntra, '加载中…');
-  drawNote(chartKline, '加载中…');
-  const isLatest = (state.date === latestDate);
-  try {
-    const kl = await fetchKline(modalStock, state.date);
-    drawKlineChart(chartKline, kl);
-  } catch (e) {
-    drawNote(chartKline, 'K线加载失败');
-  }
-  if (isLatest) {
-    try {
-      const tr = await fetchTrend(modalStock);
-      drawIntraday(chartIntra, tr.preClose, tr.points);
-    } catch (e) {
-      drawNote(chartIntra, '分时加载失败');
-    }
-  } else {
-    drawNote(chartIntra, '历史日期暂无分时数据');
-  }
-}
-
-function openChart(s) {
-  modalStock = s;
-  chartModal.classList.add('show');
-  modalTitle.innerHTML = '<span>' + esc(s.n) + '</span><span class="code">' + s.c + '</span>' + (s.zdp != null ? '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>' : '');
-  requestAnimationFrame(function () { refreshModalChart(); });
-  if (modalTimer) clearInterval(modalTimer);
-  modalTimer = setInterval(function () { refreshModalChart(); }, 30000);
-}
-
-function closeChart() {
-  chartModal.classList.remove('show');
-  modalStock = null;
-  if (modalTimer) { clearInterval(modalTimer); modalTimer = null; }
-}
-
-/* ---------- board sector panel ---------- */
-const boardState = { mode: 'featured', type: '2', list: [], currentKey: null, sort: { key: 'strength', dir: -1 } };
-const boardCache = { '1': [], '2': [], '3': [] };
-const boardFetching = {};
-
-function sinaBoardMeta(type) {
-  if (type === '1') return { url: 'https://money.finance.sina.com.cn/q/view/newFLJK.php?param=area', v: 'S_Finance_bankuai_area' };
-  if (type === '3') return { url: 'https://money.finance.sina.com.cn/q/view/newFLJK.php?param=class', v: 'S_Finance_bankuai_class' };
-  return { url: 'https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php', v: 'S_Finance_bankuai_sinaindustry' };
-}
-
-function mapSinaBoards(raw) {
-  const list = [];
-  Object.keys(raw || {}).forEach(function (k) {
-    const p = String(raw[k] || '').split(',');
-    if (p.length < 13) return;
-    const name = p[1];
-    if (!name) return;
-    list.push({
-      f12: p[0],
-      f14: name,
-      f3: parseFloat(p[5]) || 0,
-      f25: parseFloat(p[7]) || 0,
-      f128: p[12] || p[8] || '—',
-      f136: parseFloat(p[9]) || 0,
-      f104: null,
-      f105: null,
-      f62: null,
-      f20: null,
-      _cnt: parseInt(p[2], 10) || 0
-    });
-  });
-  return list.sort(function (a, b) { return (+b.f3) - (+a.f3); });
-}
-
-function loadSinaBoards(type) {
-  const meta = sinaBoardMeta(type);
-  return new Promise(function (resolve, reject) {
-    const script = document.createElement('script');
-    let settled = false;
-    const timer = setTimeout(function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块请求超时')); } }, 12000);
-    // 新浪的 JSONP 脚本用 var 声明全局变量，产生的 window 属性不可删除，
-    // 严格模式下 delete 会抛 TypeError（此前导致整个 Promise 卡死、板块一直“加载中”）。
-    function cleanup() {
-      try { delete window[meta.v]; } catch (e) { try { window[meta.v] = undefined; } catch (e2) { /* ignore */ } }
-      if (script.parentNode) script.parentNode.removeChild(script);
-      clearTimeout(timer);
-    }
-    script.onload = function () {
-      if (settled) return;
-      const raw = window[meta.v];
-      settled = true;
-      cleanup();
-      if (!raw) { reject(new Error('板块数据为空')); return; }
-      try { resolve(mapSinaBoards(raw)); } catch (e) { reject(e); }
-    };
-    script.onerror = function () { if (!settled) { settled = true; cleanup(); reject(new Error('板块网络请求失败')); } };
-    // 追加时间戳避免浏览器缓存旧响应，保证每次刷新都能拉到最新板块数据
-    script.src = meta.url + (meta.url.indexOf('?') >= 0 ? '&' : '?') + '_=' + Date.now();
-    document.head.appendChild(script);
-  });
-}
-
-async function fetchBoards(type) {
-  return loadSinaBoards(type);
-}
-
-function fetchBoardsCached(type) {
-  if (!boardFetching[type]) {
-    boardFetching[type] = fetchBoards(type).then(function (list) {
-      boardCache[type] = list;
-      return list;
-    }).finally(function () { delete boardFetching[type]; });
-  }
-  return boardFetching[type];
-}
-
-function ztHybkList() {
-  return state.data.zt.map(function (s) { return s.hybk || ''; }).filter(Boolean);
-}
-
-function ztCountFor(name, hybkList) {
-  let c = 0;
-  const nm = String(name || '');
-  if (!nm) return 0;
-  for (let i = 0; i < hybkList.length; i++) {
-    const h = hybkList[i];
-    if (!h) continue;
-    if (nm.indexOf(h) >= 0 || h.indexOf(nm) >= 0) c++;
-  }
-  return c;
-}
-
-function computeStrength(b, zc) {
-  const pct = +b.f3 || 0;
-  const lead = +b.f136 || 0;
-  return Math.round((zc * 100 + pct * 10 + lead) * 10) / 10;
-}
-
-function decorateBoards(list, type) {
-  const hybkList = ztHybkList();
-  return list.map(function (b) {
-    const zc = type === '2' ? ztCountFor(b.f14 || '', hybkList) : null;
-    b._zc = zc;
-    b._strength = computeStrength(b, zc || 0);
-    return b;
-  });
-}
-
-function fmtSignedPct(v) {
-  if (v == null || isNaN(v)) return '—';
-  const n = +v;
-  return (n > 0 ? '+' : '') + n.toFixed(2) + '%';
-}
-
-function fmtSignedMoney(v) {
-  if (v == null || isNaN(v)) return '—';
-  const n = +v, abs = Math.abs(n);
-  let s;
-  if (abs >= 1e8) s = (abs / 1e8).toFixed(2) + '亿';
-  else if (abs >= 1e4) s = (abs / 1e4).toFixed(2) + '万';
-  else s = abs.toFixed(0);
-  return (n > 0 ? '+' : (n < 0 ? '-' : '')) + s;
-}
-
-function udRatio(up, down) {
-  const u = +up || 0, d = +down || 0;
-  const t = u + d;
-  return t ? Math.round(u / t * 100) : 0;
-}
-
-function renderBoardSummary(list) {
-  if (!list.length) { boardSummary.innerHTML = ''; return; }
-  const up = list.filter(function (b) { return (+b.f3 || 0) > 0; }).length;
-  const down = list.filter(function (b) { return (+b.f3 || 0) < 0; }).length;
-  const lead = list[0];
-  let lag = list[0];
-  list.forEach(function (b) { if ((+b.f3 || 0) < (+lag.f3 || 0)) lag = b; });
-  boardSummary.innerHTML =
-    '上涨板块 <b class="up">' + up + '</b> 家　下跌板块 <b class="down">' + down + '</b> 家　|　' +
-    '领涨 <span class="up">' + esc(lead.f14) + ' ' + fmtSignedPct(lead.f3) + '</span>　|　' +
-    '领跌 <span class="down">' + esc(lag.f14) + ' ' + fmtSignedPct(lag.f3) + '</span>';
-}
-
-function renderFeaturedBoards(list) {
-  const rows = decorateBoards(list, '2').sort(function (a, b) { return b._strength - a._strength; }).slice(0, 15);
-  renderBoardSummary(list);
-  if (!rows.length) { boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>'; return; }
-  boardBody.innerHTML = rows.map(function (b, i) {
-    const r = i + 1;
-    const rankCls = r === 1 ? 'rank-1' : (r === 2 ? 'rank-2' : (r === 3 ? 'rank-3' : ''));
-    const pctCls = (+b.f3 || 0) > 0 ? 'up' : ((+b.f3 || 0) < 0 ? 'down' : '');
-    const leadCls = (+b.f136 || 0) >= 0 ? 'up' : 'down';
-    const cntHtml = b._cnt ? '<div class="hot-sub">' + b._cnt + ' 家公司</div>' : '';
-    return '<div class="hot-row"><span class="hot-rank ' + rankCls + '">' + r + '</span>' +
-      '<div class="hot-main">' +
-        '<div class="hot-name">' + esc(b.f14) + (b._zc ? ' <span class="zt-badge">涨停 ' + b._zc + '</span>' : '') + '</div>' +
-        '<div class="hot-lead">领涨 ' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="' + leadCls + '">' + fmtSignedPct(b.f136) + '</span>' : '') + '</div>' +
-        cntHtml +
-      '</div>' +
-      '<div class="hot-pct ' + pctCls + '">' + fmtSignedPct(b.f3) + '</div></div>';
+function rowHtml(key, num, pct, items) {
+  const cls = pct >= 50 ? 'up' : '';
+  const cells = items.map((it) => {
+    const tags = blockTags(it.code, 1);
+    const tag = tags[0] || '';
+    const chgCls = it.chg == null ? 'flat' : it.chg > 0 ? 'up' : it.chg < 0 ? 'down' : 'flat';
+    const label = it.status === 'up' ? '成' : it.status === 'boom' ? '炸' : '败';
+    return `<span class="stk st ${it.status}" data-code="${it.code}" title="${esc(it.name)} ${it.level ? it.level + '板' : ''}">
+      <i class="mk">${mkName(it.code)}</i>
+      <em class="nm">${esc(it.name)}</em>
+      <i class="st">${label}</i>
+      <b class="chg ${chgCls}">${it.chg == null ? '—' : fmtPct(it.chg, false)}</b>
+      <i class="sec ${S.chip && tag === S.chip ? 'hl' : ''}">${esc(tag)}</i>
+    </span>`;
   }).join('');
+  return `<div class="lrow">
+    <div class="lrow-key"><b>${key}</b><span class="rate">${num}<i>${pct ? ' = ' + pct.toFixed(0) + '%' : ''}</i></span></div>
+    <div class="lrow-stocks">${cells}</div>
+  </div>`;
 }
 
-function renderBoardTable(list) {
-  boardState.list = decorateBoards(list, boardState.type);
-  renderBoardSummary(list);
-  const q = boardSearch.value.trim().toLowerCase();
-  let rows = boardState.list.slice();
-  if (q) rows = rows.filter(function (b) { return String(b.f14 || '').toLowerCase().indexOf(q) >= 0; });
-  const key = boardState.sort.key, dir = boardState.sort.dir;
-  rows.sort(function (a, b) {
-    if (key === 'strength') return (a._strength - b._strength) * dir;
-    if (key === 'f14') return String(a.f14 || '').localeCompare(String(b.f14 || ''), 'zh') * dir;
-    return ((+a[key] || 0) - (+b[key] || 0)) * dir;
-  });
-  if (!rows.length) { boardBody.innerHTML = '<div class="empty-note">无匹配板块</div>'; return; }
-  const arrow = function (k) { return boardState.sort.key === k ? (boardState.sort.dir > 0 ? ' ▲' : ' ▼') : ''; };
-  const head = '<thead><tr>' +
-    '<th class="num sortable" data-bk="strength">强度' + arrow('strength') + '</th>' +
-    '<th class="l sortable" data-bk="f14">板块名称' + arrow('f14') + '</th>' +
-    '<th class="num sortable" data-bk="f3">涨跌幅' + arrow('f3') + '</th>' +
-    '<th class="num sortable" data-bk="_cnt">公司家数' + arrow('_cnt') + '</th>' +
-    '<th class="l">领涨股</th>' +
-    '<th class="num sortable" data-bk="f25">成交额' + arrow('f25') + '</th>' +
-    '</tr></thead>';
-  const body = '<tbody>' + rows.map(function (b) {
-    return '<tr><td class="num up">' + b._strength + '</td>' +
-      '<td class="l name">' + esc(b.f14) + '<span class="board-code">' + esc(b.f12) + '</span>' + (b._zc ? ' <span class="zt-badge">涨停' + b._zc + '</span>' : '') + '</td>' +
-      '<td class="num"><span class="pct-pill ' + pclass(b.f3) + '">' + fmtSignedPct(b.f3) + '</span></td>' +
-      '<td class="num muted">' + (b._cnt || 0) + '</td>' +
-      '<td class="l">' + esc(b.f128 || '—') + (b.f136 != null ? ' <span class="muted">' + fmtSignedPct(b.f136) + '</span>' : '') + '</td>' +
-      '<td class="num">' + fmtMoney(b.f25) + '</td></tr>';
-  }).join('') + '</tbody>';
-  boardBody.innerHTML = '<div class="board-table-wrap"><table>' + head + body + '</table></div>';
-  restoreScrolls();
-}
-
-function renderBoards() {
-  const mode = boardState.mode;
-  const type = boardState.type;
-  const key = mode === 'featured' ? 'featured' : 'all-' + type;
-  const targetType = mode === 'featured' ? '2' : type;
-  const cached = boardCache[targetType];
-  if (boardState.currentKey !== key) {
-    boardState.currentKey = key;
-    if (cached && cached.length) {
-      if (mode === 'featured') renderFeaturedBoards(cached);
-      else renderBoardTable(cached);
-    } else {
-      boardBody.innerHTML = '<div class="empty-note">加载中…</div>';
-    }
-  }
-  fetchBoardsCached(targetType).then(function (list) {
-    if (boardState.currentKey !== key) return;
-    if (list && list.length) {
-      if (mode === 'featured') renderFeaturedBoards(list);
-      else renderBoardTable(list);
-    } else if (!(boardCache[targetType] && boardCache[targetType].length)) {
-      boardBody.innerHTML = '<div class="empty-note">暂无板块数据</div>';
-    }
-  }).catch(function () {
-    if (boardState.currentKey !== key) return;
-    if (boardCache[targetType] && boardCache[targetType].length) {
-      toast('板块数据更新失败，显示最近一次数据');
-    } else {
-      boardBody.innerHTML = '<div class="empty-note">板块数据加载失败 <button class="ghost-btn small" data-retry-board>重试</button></div>';
-    }
+/* ---------------------------- sector ---------------------------- */
+async function ensureMinutes(codes) {
+  const need = codes.filter((c) => !S.minute.has(c) && !S.minutePending.has(c));
+  if (!need.length) return;
+  need.forEach((c) => S.minutePending.add(c));
+  await mapLimit(need, 8, async (code) => {
+    try {
+      const m = await fetchMinute(code);
+      if (m) S.minute.set(code, m);
+    } catch (e) { /* ignore */ }
+    finally { S.minutePending.delete(code); }
   });
 }
 
-/* ---------- strong stock pool ---------- */
-const strongState = { search: '', sort: { key: 'zdp', dir: -1 } };
+async function buildBoardCurves() {
+  const sel = S.day.blocks.filter((b) => S.boardSel.has(b.name));
+  if (!sel.length) return [];
+  const codes = Array.from(new Set(sel.flatMap((b) => b.stocks.map((s) => s.code))));
+  await ensureMinutes(codes);
 
-function ccLabel(cc) {
-  if (cc === 3) return '60日新高且近期多次涨停';
-  if (cc === 2) return '近期多次涨停';
-  if (cc === 1) return '60日新高';
-  return '—';
-}
-
-function ccBadge(cc) {
-  const cls = cc === 3 ? 'cc3' : (cc === 2 ? 'cc2' : (cc === 1 ? 'cc1' : ''));
-  return '<span class="cc-badge ' + cls + '">' + ccLabel(cc) + '</span>';
-}
-
-function strongSortVal(s, key) {
-  if (key === 'n') return String(s.n || '');
-  if (key === 'hybk') return String(s.hybk || '');
-  if (key === 'zttj') return s.zttj ? s.zttj.ct * 100 + s.zttj.days : -1;
-  return +(s[key]) || 0;
-}
-
-function getStrongRows() {
-  let rows = state.data.qs.slice();
-  const q = strongState.search.trim().toLowerCase();
-  if (q) rows = rows.filter((s) => String(s.c).includes(q) || String(s.n || '').toLowerCase().includes(q) || String(s.hybk || '').toLowerCase().includes(q));
-  const col = COLS.qs.find((c) => c.k === strongState.sort.key);
-  const key = col && col.sort;
-  if (key) {
-    const dir = strongState.sort.dir;
-    rows.sort((a, b) => {
-      let va = strongSortVal(a, key), vb = strongSortVal(b, key);
-      if (key === 'n' || key === 'hybk') return String(va).localeCompare(String(vb), 'zh') * dir;
-      return (va - vb) * dir;
+  return sel.map((b) => {
+    const pts = b.stocks.map((s) => {
+      const m = S.minute.get(s.code);
+      if (!m || !m.pre) return null;
+      return { m, first: s.first || 0 };
+    }).filter(Boolean);
+    if (!pts.length) return { name: b.name, values: [], ztCount: b.zt };
+    const arrs = pts.map((p) => {
+      const a = new Array(242).fill(null);
+      for (const [slot, v] of p.m.pts) a[slot] = v;
+      let zslot = 999;
+      if (p.first) {
+        const d = new Date(+p.first * 1000 + 8 * 3600 * 1000);
+        zslot = slotOf(d.getUTCHours() * 60 + d.getUTCMinutes());
+      }
+      return { a, pre: p.m.pre, zslot };
     });
-  }
-  return rows;
+    const values = [];
+    const ztSeries = [];
+    for (let slot = 0; slot <= 241; slot++) {
+      let sum = 0, n = 0, zc = 0;
+      for (const p of arrs) {
+        const v = p.a[slot];
+        if (v != null) { sum += (v - p.pre) / p.pre * 100; n++; }
+        if (p.zslot <= slot) zc++;
+      }
+      values.push(n ? sum / n : null);
+      ztSeries.push(zc);
+    }
+    return { name: b.name, values, ztCount: b.zt, ztSeries };
+  });
 }
 
-function strongCell(k, s) {
-  switch (k) {
-    case 'code': return '<span class="code">' + esc(s.c) + '</span>';
-    case 'name': return '<a class="name name-link" href="javascript:void(0)">' + esc(s.n) + '</a>';
-    case 'price': return '<span class="' + pclass(s.zdp) + '">' + fmtPrice(s.p) + '</span>';
-    case 'zdp': return '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>';
-    case 'ztp': return '<span class="muted">' + fmtPrice(s.ztp) + '</span>';
-    case 'hs': return fmtPct(s.hs);
-    case 'lb': return s.lb == null ? '—' : (+s.lb).toFixed(2);
-    case 'zs': return '<span class="' + pclass(s.zs) + '">' + fmtPct(s.zs) + '</span>';
-    case 'nh': return s.nh == 1 ? '<span class="up">是</span>' : '<span class="muted">—</span>';
-    case 'zttj': return '<span class="muted">' + fmtZttj(s.zttj) + '</span>';
-    case 'cc': return ccBadge(s.cc);
-    case 'amount': return fmtMoney(s.amount);
-    case 'ltsz': return fmtMoney(s.ltsz);
-    case 'hybk': return '<span class="muted">' + esc(s.hybk || '—') + '</span>';
+async function renderSector() {
+  if (!S.day) return;
+  const listEl = $('#sectorList');
+  const blocks = S.day.blocks;
+  if (!blocks.length) {
+    listEl.innerHTML = '<div class="empty">暂无板块数据</div>';
+    return;
   }
-  return '';
+  listEl.innerHTML = blocks.slice(0, 60).map((b) => {
+    const on = S.boardSel.has(b.name);
+    const chgCls = b.chg > 0 ? 'up' : b.chg < 0 ? 'down' : '';
+    return `<label class="srow ${on ? 'on' : ''}" data-board="${esc(b.name)}">
+      <input type="checkbox" ${on ? 'checked' : ''}>
+      <span class="nm">${esc(b.name)} <em>${b.zt}</em></span>
+      <span class="val ${chgCls}">${fmtPct(b.chg, false)}</span>
+      <span class="sub">${b.cont ? b.cont + '连' : ''}</span>
+    </label>`;
+  }).join('');
+
+  $('#sectorHint').textContent = `已选 ${S.boardSel.size} 个板块 · 勾选左侧对比走势`;
+  if (!S.boardSel.size) return;
+
+  $('#sectorHint').textContent = '正在加载分时…';
+  S.boardCurves = await buildBoardCurves();
+  updateSectorHint();
+  drawSectorChart();
 }
 
-function renderStrongPool() {
-  const list = state.data.qs;
-  const ztCodes = {};
-  state.data.zt.forEach((s) => { ztCodes[s.c] = true; });
-  const ztToday = list.filter((s) => ztCodes[s.c]).length;
-  const nhCount = list.filter((s) => s.nh == 1).length;
-  const multiCount = list.filter((s) => s.cc === 2 || s.cc === 3).length;
-  const lbSum = list.reduce((a, s) => a + (+s.lb || 0), 0);
-  const avgLb = list.length ? lbSum / list.length : 0;
+function updateSectorHint() {
+  const txt = {
+    chg: '成员股等权涨幅 · 分钟级',
+    strength: '强度 = 涨停家数 × 100 + 涨幅 × 10',
+    zt: '按首封时间累计的涨停家数',
+  }[S.boardMode] || '';
+  $('#sectorHint').textContent = `已选 ${S.boardSel.size} 个板块 · ${txt}`;
+}
 
-  strongStats.innerHTML =
-    '<span class="stat-chip">池内 <b>' + list.length + '</b> 家</span>' +
-    '<span class="stat-chip">今日已涨停 <b>' + ztToday + '</b> 家</span>' +
-    '<span class="stat-chip">60日新高 <b>' + nhCount + '</b> 家</span>' +
-    '<span class="stat-chip">近期多次涨停 <b>' + multiCount + '</b> 家</span>' +
-    '<span class="stat-chip">平均量比 <b>' + avgLb.toFixed(2) + '</b></span>';
+const COLORS = ['#2563eb', '#e11d48', '#f59e0b', '#10b981', '#8b5cf6', '#06b6d4', '#ec4899', '#64748b', '#84cc16', '#f97316'];
 
-  const rows = getStrongRows();
-  if (!rows.length) {
-    let note;
-    if (list.length) note = '无匹配股票';
-    else if (state.qsError) note = '强势股池数据加载失败 <button class="ghost-btn small" data-retry-strong>重试</button>';
-    else note = '暂无强势股池数据（可能为非交易日或数据尚未生成）';
-    strongBody.innerHTML = '<div class="empty-note">' + note + '</div>';
+function drawSectorChart() {
+  const canvas = $('#sectorCanvas');
+  canvas._tipEl = $('#sectorTip');
+  const curves = (S.boardCurves || []).filter((c) => c.values.length);
+  if (!curves.length) {
+    drawEmpty(canvas, '暂无分时数据');
     return;
   }
 
-  const cols = COLS.qs;
-  const arrow = function (k) { return strongState.sort.key === k ? (strongState.sort.dir > 0 ? ' ▲' : ' ▼') : ''; };
-  const head = '<thead><tr>' + cols.map((c) => {
-    if (c.k === 'idx') return '<th class="c">#</th>';
-    const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '') + (c.sort ? ' sortable' : '');
-    return '<th data-k="' + c.k + '" class="' + cls.trim() + '">' + c.label + (c.sort ? arrow(c.k) : '') + '</th>';
-  }).join('') + '</tr></thead>';
+  const mode = S.boardMode;
+  const series = curves.map((c, i) => {
+    let vals;
+    if (mode === 'strength') {
+      vals = c.values.map((v, idx) => (v == null ? null : (c.ztSeries[idx] * 100 + v * 10)));
+    } else if (mode === 'chg') {
+      vals = c.values;
+    } else {
+      vals = c.ztSeries.map((v) => v);
+    }
+    return { name: c.name, color: COLORS[i % COLORS.length], vals };
+  });
 
-  const body = '<tbody>' + rows.map((s, i) => {
-    const cells = cols.map((c) => {
-      if (c.k === 'idx') return '<td class="idx">' + (i + 1) + '</td>';
-      const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '');
-      return '<td class="' + cls.trim() + '">' + strongCell(c.k, s) + '</td>';
-    });
-    return '<tr data-code="' + s.c + '" data-m="' + s.m + '" data-name="' + esc(s.n) + '">' + cells.join('') + '</tr>';
-  }).join('') + '</tbody>';
-
-  strongBody.innerHTML = '<div class="board-table-wrap strong-table-wrap"><table>' + head + body + '</table></div>';
-  restoreScrolls();
+  drawLineChart(canvas, {
+    series,
+    xFrom: 0, xTo: 241,
+    xLabels: SLOT_LABELS,
+    yFmt: (v) => (mode === 'chg' ? v.toFixed(1) + '%' : v.toFixed(0)),
+    legend: true,
+    tipFmt: (items, idx) => {
+      const t = labelOfSlot(idx);
+      const head = `<div style="margin-bottom:2px;color:#c7d2fe">${t}</div>`;
+      return head + items.map((it) => {
+        const unit = mode === 'zt' ? ' 家' : mode === 'chg' ? '%' : '';
+        return `<div><i style="background:${it.color}"></i>${esc(it.name)}<span class="tv">${it.v == null ? '—' : it.v.toFixed(mode === 'zt' ? 0 : 2) + unit}</span></div>`;
+      }).join('');
+    },
+  });
 }
 
-function exportStrongCSV() {
-  const rows = getStrongRows();
-  if (!rows.length) { toast('没有可导出的强势股池数据'); return; }
-  const cols = COLS.qs;
-  const header = cols.map((c) => c.label).join(',');
-  const lines = rows.map((s, i) => cols.map((c) => {
-    let v = '';
-    if (c.k === 'idx') v = i + 1;
-    else if (c.k === 'code') v = s.c;
-    else if (c.k === 'name') v = s.n;
-    else if (c.k === 'price') v = fmtPrice(s.p);
-    else if (c.k === 'zdp') v = fmtPct(s.zdp);
-    else if (c.k === 'ztp') v = fmtPrice(s.ztp);
-    else if (c.k === 'hs') v = fmtPct(s.hs);
-    else if (c.k === 'lb') v = s.lb;
-    else if (c.k === 'zs') v = fmtPct(s.zs);
-    else if (c.k === 'nh') v = s.nh == 1 ? '是' : '否';
-    else if (c.k === 'zttj') v = fmtZttj(s.zttj);
-    else if (c.k === 'cc') v = ccLabel(s.cc);
-    else if (c.k === 'amount') v = s.amount;
-    else if (c.k === 'ltsz') v = s.ltsz;
-    else if (c.k === 'hybk') v = s.hybk;
-    return csvQuote(v);
-  }).join(','));
-  const csv = '\uFEFF' + header + '\n' + lines.join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = '强势股池_' + state.date + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
+function labelOfSlot(idx) {
+  let min;
+  if (idx <= 120) min = 570 + idx;
+  else min = 780 + (idx - 121);
+  return `${pad2(Math.floor(min / 60))}:${pad2(min % 60)}`;
 }
 
-/* ---------- charts ---------- */
-function setupCanvas(canvas, H) {
+/* ---------------------------- chart ---------------------------- */
+function drawLineChart(canvas, cfg) {
+  canvas._cfg = cfg;
+  canvas._hover = null;
+  paintChart(canvas);
+  bindChartEvents(canvas);
+}
+
+function drawEmpty(canvas, msg) {
   const dpr = window.devicePixelRatio || 1;
-  const W = canvas.clientWidth || 560;
-  canvas.width = Math.round(W * dpr);
-  canvas.height = Math.round(H * dpr);
-  canvas.style.height = H + 'px';
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.max(200, Math.round(rect.width)), H = Math.max(120, Math.round(rect.height));
+  canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext('2d');
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  return { ctx: ctx, W: W, H: H };
-}
-
-function roundRect(ctx, x, y, w, h, r) {
-  if (typeof ctx.roundRect === 'function') { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); return; }
-  const rr = Math.min(r, w / 2, h / 2);
-  ctx.beginPath();
-  ctx.moveTo(x + rr, y);
-  ctx.lineTo(x + w - rr, y); ctx.arcTo(x + w, y, x + w, y + rr, rr);
-  ctx.lineTo(x + w, y + h - rr); ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
-  ctx.lineTo(x + rr, y + h); ctx.arcTo(x, y + h, x, y + h - rr, rr);
-  ctx.lineTo(x, y + rr); ctx.arcTo(x, y, x + rr, y, rr);
-  ctx.closePath();
-}
-
-function emptyChart(ctx, W, H) {
-  ctx.fillStyle = '#7a8699';
-  ctx.font = '12px sans-serif';
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#9aa5b1';
+  ctx.font = '13px -apple-system, sans-serif';
   ctx.textAlign = 'center';
-  ctx.fillText('暂无数据', W / 2, H / 2);
+  ctx.fillText(msg, W / 2, H / 2);
 }
 
-function drawVBar(canvas, labels, values, opts) {
-  opts = opts || {};
-  const H = opts.height || 230;
-  const g = setupCanvas(canvas, H);
-  const ctx = g.ctx, W = g.W;
+function paintChart(canvas) {
+  const cfg = canvas._cfg;
+  if (!cfg) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const W = Math.max(240, Math.round(rect.width));
+  const H = Math.max(140, Math.round(rect.height));
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
-  if (!labels.length || values.every((v) => !v)) { emptyChart(ctx, W, H); return; }
-  const padL = 34, padR = 12, padT = 18, padB = 46;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const max = Math.max(1, Math.max.apply(null, values));
 
-  ctx.strokeStyle = 'rgba(17,24,39,0.06)';
-  ctx.fillStyle = '#7a8699';
-  ctx.font = '11px sans-serif';
+  const legendH = cfg.legend ? 32 : 8;
+  const pad = { l: 58, r: 16, t: legendH, b: 24 };
+  const iw = W - pad.l - pad.r;
+  const ih = H - pad.t - pad.b;
+  if (iw < 30 || ih < 30) return;
+
+  const all = [];
+  for (const s of cfg.series) for (const v of s.vals) if (v != null && isFinite(v)) all.push(v);
+  if (!all.length) { drawEmpty(canvas, '暂无数据'); return; }
+  let mn = Math.min.apply(null, all), mx = Math.max.apply(null, all);
+  if (mn === mx) { mn -= 1; mx += 1; }
+  const step = stepFor((mx - mn) / 4);
+  let y0 = Math.floor(mn / step) * step;
+  let y1 = y0;
+  while (y1 < mx) y1 += step;
+  if (y1 === y0) y1 = y0 + step;
+
+  const spanX = Math.max(1, cfg.xTo - cfg.xFrom);
+  const X = (i) => pad.l + (i - cfg.xFrom) / spanX * iw;
+  const Y = (v) => pad.t + ih - (v - y0) / (y1 - y0) * ih;
+
+  ctx.font = '11px -apple-system, sans-serif';
   ctx.textAlign = 'right';
-  const steps = 4;
-  for (let i = 0; i <= steps; i++) {
-    const y = padT + plotH - plotH * i / steps;
-    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W - padR, y); ctx.stroke();
-    ctx.fillText(String(Math.round(max * i / steps)), padL - 6, y + 4);
+  const decimals = (y1 - y0) / step >= 4 ? 0 : 1;
+  for (let v = y0; v <= y1 + 1e-9; v += step) {
+    const y = Y(v);
+    ctx.strokeStyle = '#eff3f8';
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillStyle = '#93a0b4';
+    const label = cfg.yFmt ? cfg.yFmt(v) : v.toFixed(Math.abs(step) < 1 ? 1 : 0);
+    ctx.fillText(label, pad.l - 8, y + 4);
+  }
+  if (y0 < 0 && y1 > 0) {
+    ctx.strokeStyle = '#dde4ee';
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(pad.l, Y(0)); ctx.lineTo(W - pad.r, Y(0)); ctx.stroke();
+    ctx.setLineDash([]);
   }
 
-  const n = labels.length;
-  const bw = Math.min(42, plotW / n * 0.6);
-  labels.forEach((lab, i) => {
-    const x = padL + plotW * (i + 0.5) / n;
-    const h = plotH * values[i] / max;
-    const y = padT + plotH - h;
-    const grad = ctx.createLinearGradient(0, y, 0, padT + plotH);
-    grad.addColorStop(0, opts.color || '#ff6a6a');
-    grad.addColorStop(1, opts.color2 || '#ffc9c9');
-    ctx.fillStyle = grad;
-    roundRect(ctx, x - bw / 2, y, bw, Math.max(h, 0), 3);
-    ctx.fill();
-    if (values[i] > 0) {
-      ctx.fillStyle = '#1f2733'; ctx.textAlign = 'center'; ctx.font = '11px sans-serif';
-      ctx.fillText(String(values[i]), x, y - 4);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#93a0b4';
+  for (const pair of cfg.xLabels || []) {
+    const idx = pair[0], lab = pair[1];
+    if (idx < cfg.xFrom || idx > cfg.xTo) continue;
+    const x = X(idx);
+    ctx.strokeStyle = '#f5f8fc';
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ih); ctx.stroke();
+    ctx.fillText(lab, x, H - 8);
+  }
+
+  ctx.lineJoin = 'round';
+  ctx.lineCap = 'round';
+  for (const s of cfg.series) {
+    if (!s.vals) continue;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 1.7;
+    ctx.beginPath();
+    let pen = false;
+    for (let i = 0; i < s.vals.length; i++) {
+      const v = s.vals[i];
+      if (v == null || !isFinite(v)) { pen = false; continue; }
+      const x = X(cfg.xFrom + i), y = Y(v);
+      if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
     }
-    ctx.save();
-    ctx.translate(x, padT + plotH + 10);
-    ctx.rotate(-Math.PI / 4);
-    ctx.fillStyle = '#7a8699'; ctx.textAlign = 'right'; ctx.font = '11px sans-serif';
-    ctx.fillText(lab, 0, 0);
-    ctx.restore();
+    ctx.stroke();
+  }
+
+  canvas._legendRects = [];
+  if (cfg.legend) {
+    let x = pad.l, y = 15;
+    ctx.textAlign = 'left';
+    ctx.font = '12px -apple-system, sans-serif';
+    for (const s of cfg.series) {
+      const w = ctx.measureText(s.name).width + 24;
+      if (x + w > W - pad.r) { x = pad.l; y += 21; }
+      roundedRect(ctx, x, y - 8, 10, 10, 2, s.color);
+      ctx.fillStyle = '#4b5563';
+      ctx.fillText(s.name, x + 15, y);
+      canvas._legendRects.push({ x: x - 4, y: y - 14, w, h: 20, name: s.name });
+      x += w + 4;
+    }
+  }
+
+  if (canvas._hover != null) {
+    const idx = canvas._hover;
+    const x = X(idx);
+    ctx.strokeStyle = '#c7d2e0';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ih); ctx.stroke();
+    ctx.setLineDash([]);
+    for (const s of cfg.series) {
+      const v = s.vals[idx - cfg.xFrom];
+      if (v == null || !isFinite(v)) continue;
+      ctx.beginPath();
+      ctx.arc(x, Y(v), 3, 0, Math.PI * 2);
+      ctx.fillStyle = s.color; ctx.fill();
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 1.6; ctx.stroke();
+    }
+  }
+}
+
+function bindChartEvents(canvas) {
+  if (canvas._bound) return;
+  canvas._bound = true;
+
+  canvas.addEventListener('mousemove', (ev) => {
+    const cfg = canvas._cfg;
+    if (!cfg) return;
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    const legendH = cfg.legend ? 32 : 8;
+    const padL = 58, padR = 16, padT = legendH, padB = 24;
+    const iw = r.width - padL - padR;
+    if (mx < padL || mx > r.width - padR || my < padT || my > r.height - padB) {
+      if (canvas._hover != null) { canvas._hover = null; paintChart(canvas); }
+      if (canvas._tipEl) canvas._tipEl.classList.remove('on');
+      return;
+    }
+    const ratio = (mx - padL) / iw;
+    const idx = Math.round(cfg.xFrom + ratio * (cfg.xTo - cfg.xFrom));
+    if (idx !== canvas._hover) {
+      canvas._hover = idx;
+      paintChart(canvas);
+    }
+    const tip = canvas._tipEl;
+    if (tip && cfg.tipFmt) {
+      const items = cfg.series.map((s) => ({ name: s.name, color: s.color, v: s.vals[idx - cfg.xFrom] }))
+        .filter((it) => it.v != null && isFinite(it.v));
+      tip.innerHTML = cfg.tipFmt(items, idx);
+      const host = tip.parentElement.getBoundingClientRect();
+      tip.style.left = (mx + 0) + 'px';
+      tip.style.top = (my + 0) + 'px';
+      tip.classList.add('on');
+      void host;
+    }
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    if (canvas._hover != null) { canvas._hover = null; paintChart(canvas); }
+    if (canvas._tipEl) canvas._tipEl.classList.remove('on');
+  });
+
+  canvas.addEventListener('click', (ev) => {
+    const rects = canvas._legendRects || [];
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    for (const rc of rects) {
+      if (mx >= rc.x && mx <= rc.x + rc.w && my >= rc.y && my <= rc.y + rc.h) {
+        if (S.boardSel.has(rc.name)) {
+          if (S.boardSel.size > 1) S.boardSel.delete(rc.name);
+        } else {
+          S.boardSel.add(rc.name);
+        }
+        renderSector();
+        break;
+      }
+    }
   });
 }
 
-function drawHBar(canvas, labels, values, opts) {
-  opts = opts || {};
-  const rowH = 26;
-  const H = Math.max(180, labels.length * rowH + 26);
-  const g = setupCanvas(canvas, H);
-  const ctx = g.ctx, W = g.W;
-  ctx.clearRect(0, 0, W, H);
-  if (!labels.length || values.every((v) => !v)) { emptyChart(ctx, W, H); return; }
-
-  ctx.font = '12px sans-serif';
-  let labelW = 0;
-  labels.forEach((l) => { labelW = Math.max(labelW, ctx.measureText(l).width); });
-  const padL = labelW + 14, padR = 40;
-  const plotW = W - padL - padR;
-  const max = Math.max(1, Math.max.apply(null, values));
-
-  labels.forEach((lab, i) => {
-    const y = i * rowH + 6;
-    ctx.fillStyle = '#3a4556'; ctx.textAlign = 'right';
-    ctx.fillText(lab, padL - 8, y + 13);
-    const w = plotW * values[i] / max;
-    const grad = ctx.createLinearGradient(padL, 0, padL + w, 0);
-    grad.addColorStop(0, '#ffa06a'); grad.addColorStop(1, '#ff6a6a');
-    ctx.fillStyle = grad;
-    roundRect(ctx, padL, y + 3, Math.max(w, 1), rowH - 8, 3);
-    ctx.fill();
-    ctx.fillStyle = '#1f2733'; ctx.textAlign = 'left';
-    ctx.fillText(String(values[i]), padL + w + 6, y + 13);
-  });
+function roundedRect(ctx, x, y, w, h, r, fill) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+  ctx.fillStyle = fill;
+  ctx.fill();
 }
 
-function renderCharts() {
-  const zt = state.data.zt;
-
-  const lbBuckets = [
-    { label: '首板', lo: 1, hi: 1 }, { label: '2板', lo: 2, hi: 2 },
-    { label: '3板', lo: 3, hi: 3 }, { label: '4板', lo: 4, hi: 4 },
-    { label: '5板', lo: 5, hi: 5 }, { label: '6板+', lo: 6, hi: Infinity }
-  ];
-  const lbCounts = lbBuckets.map((b) => zt.filter((s) => { const l = s.lbc || 0; return l >= b.lo && l <= b.hi; }).length);
-  drawVBar(chartLb, lbBuckets.map((b) => b.label), lbCounts);
-
-  const tCounts = TIME_BUCKETS.map(() => 0);
-  zt.forEach((s) => { const b = fbtBucket(s.fbt); if (b >= 0) tCounts[b]++; });
-  drawVBar(chartTime, TIME_BUCKETS.map((b) => b.label), tCounts, { height: 230 });
-
-  const ind = countBy(zt.map((s) => s.hybk || '其他'));
-  const entries = Object.entries(ind).sort((a, b) => b[1] - a[1]).slice(0, 10);
-  drawHBar(chartInd, entries.map((e) => e[0]), entries.map((e) => e[1]));
+function stepFor(span) {
+  const raw = Math.max(1e-9, span);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  const step = norm >= 5 ? 5 : norm >= 2 ? 2 : 1;
+  return step * mag;
 }
 
-/* ---------- table ---------- */
-function renderHead() {
-  const cols = COLS[state.tab];
-  theadEl.innerHTML = '<tr>' + cols.map((c) => {
-    let arrow = '';
-    if (c.sort && state.sort.key === c.k) arrow = state.sort.dir > 0 ? ' ▲' : ' ▼';
-    const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l ' : (c.k === 'idx' ? 'c ' : '')) + (c.sort ? 'sortable' : '');
-    return '<th data-k="' + c.k + '" class="' + cls.trim() + '">' + c.label + arrow + '</th>';
-  }).join('') + '</tr>';
+/* ---------------------------- list table ---------------------------- */
+const TABLE_COLS = {
+  zt: [
+    { t: '#', w: 40, v: (s, i) => i + 1 },
+    { t: '代码', v: (s) => `<span class="code">${s.code}</span>` },
+    { t: '名称', v: (s) => `<span class="name" data-code="${s.code}">${esc(s.name)}</span>` },
+    { t: '最新价', v: (s) => s.price != null ? s.price.toFixed(2) : '—' },
+    { t: '涨跌幅', cls: 'chg', v: (s) => fmtPct(s.chg) },
+    { t: '连板', v: (s) => `<span class="tag">${s.level === 1 ? '首板' : s.level + '板'}</span>` },
+    { t: '涨停统计', v: (s) => `<span class="tag g">${esc(s.daysText || '—')}</span>` },
+    { t: '板块概念', cls: 'tags-cell', v: (s) => tagsHtml(s.code) },
+    { t: '首封', v: (s) => fmtTs(s.first) },
+    { t: '最后封板', v: (s) => fmtTs(s.last) },
+    { t: '炸板', v: (s) => s.openNum || 0 },
+    { t: '封单额', v: (s) => fmtAmt(s.orderAmt) },
+    { t: '换手', v: (s) => pctOf(q(s.code)?.turnover ?? s.turnover) },
+    { t: '成交额', v: (s) => fmtAmt(q(s.code)?.amt ?? s.amount) },
+    { t: '流通市值', v: (s) => fmtAmt(q(s.code)?.flowCap ?? s.flowCap) },
+  ],
+  zb: [
+    { t: '#', v: (s, i) => i + 1 },
+    { t: '代码', v: (s) => `<span class="code">${s.code}</span>` },
+    { t: '名称', v: (s) => `<span class="name" data-code="${s.code}">${esc(s.name)}</span>` },
+    { t: '最新价', v: (s) => s.price != null ? s.price.toFixed(2) : '—' },
+    { t: '涨跌幅', cls: 'chg', v: (s) => fmtPct(chgOf(s.code, s.chg)) },
+    { t: '行业', v: (s) => `<span class="tag g">${esc(s.industry || '—')}</span>` },
+    { t: '首封', v: (s) => fmtEmTime(s.first) },
+    { t: '最后封板', v: (s) => fmtEmTime(s.last) },
+    { t: '炸板次数', v: (s) => s.openNum || 0 },
+    { t: '换手', v: (s) => pctOf(q(s.code)?.turnover ?? s.turnover) },
+    { t: '成交额', v: (s) => fmtAmt(q(s.code)?.amt ?? s.amount) },
+  ],
+  dt: [
+    { t: '#', v: (s, i) => i + 1 },
+    { t: '代码', v: (s) => `<span class="code">${s.code}</span>` },
+    { t: '名称', v: (s) => `<span class="name" data-code="${s.code}">${esc(s.name)}</span>` },
+    { t: '最新价', v: (s) => s.price != null ? s.price.toFixed(2) : '—' },
+    { t: '涨跌幅', cls: 'chg', v: (s) => fmtPct(chgOf(s.code, s.chg)) },
+    { t: '连续跌停', v: (s) => s.days ? s.days + ' 天' : '—' },
+    { t: '行业', v: (s) => `<span class="tag g">${esc(s.industry || '—')}</span>` },
+    { t: '最后封板', v: (s) => fmtEmTime(s.last) },
+    { t: '封单额', v: (s) => fmtAmt(s.orderAmt) },
+    { t: '换手', v: (s) => pctOf(q(s.code)?.turnover ?? s.turnover) },
+    { t: '成交额', v: (s) => fmtAmt(q(s.code)?.amt ?? s.amount) },
+  ],
+};
+
+function tagsHtml(code, n = 2) {
+  const tags = blockTags(code, n);
+  if (!tags.length) return '—';
+  return `<span class="tags">${tags.map((t) => `<span class="tag b">${esc(t)}</span>`).join('')}</span>`;
 }
 
-function cellHTML(k, s) {
-  switch (k) {
-    case 'code': return '<span class="code">' + esc(s.c) + '</span>';
-    case 'name': return '<a class="name name-link" href="javascript:void(0)">' + esc(s.n) + '</a>';
-    case 'price': return '<span class="' + pclass(s.zdp) + '">' + fmtPrice(s.p) + '</span>';
-    case 'zdp': return '<span class="' + pclass(s.zdp) + '">' + fmtPct(s.zdp) + '</span>';
-    case 'lbc': return lbcBadge(s.lbc);
-    case 'days': return s.days ? s.days + '天' : '—';
-    case 'zttj': return '<span class="muted">' + fmtZttj(s.zttj) + '</span>';
-    case 'fbt': return '<span class="time">' + fmtTime(s.fbt) + '</span>';
-    case 'lbt': return '<span class="time">' + fmtTime(s.lbt) + '</span>';
-    case 'zbc': return s.zbc > 0 ? '<span class="warn">' + s.zbc + '</span>' : '0';
-    case 'fund': return fmtMoney(s.fund);
-    case 'hs': return fmtPct(s.hs);
-    case 'amount': return fmtMoney(s.amount);
-    case 'zf': return fmtPct(s.zf);
-    case 'hybk': return '<span class="muted">' + esc(s.hybk || '—') + '</span>';
+function currentRows() {
+  const tab = S.tab;
+  let rows = S.day[tab] || [];
+  if (tab === 'zt') {
+    if (S.level) {
+      const lv = +S.level;
+      rows = rows.filter((s) => (lv >= 6 ? (s.level || 1) >= 6 : (s.level || 1) === lv));
+    }
   }
-  return '';
-}
-
-function sortVal(s, key) {
-  if (key === 'n') return String(s.n || '');
-  if (key === 'hybk') return String(s.hybk || '');
-  if (key === 'zttj') return s.zttj ? s.zttj.ct * 100 + s.zttj.days : -1;
-  return +(s[key]) || 0;
-}
-
-function getRows() {
-  let rows = state.data[state.tab].slice();
-  const f = state.filters;
-  if (f.search) {
-    const q = f.search.trim().toLowerCase();
-    rows = rows.filter((s) => String(s.c).includes(q) || String(s.n || '').toLowerCase().includes(q));
-  }
-  if (state.tab === 'zt' && f.lbc !== 'all') {
-    if (f.lbc === '5p') rows = rows.filter((s) => (s.lbc || 0) >= 6);
-    else rows = rows.filter((s) => (s.lbc || 0) === +f.lbc);
-  }
-  if (f.industry) rows = rows.filter((s) => (s.hybk || '') === f.industry);
-
-  const col = COLS[state.tab].find((c) => c.k === state.sort.key);
-  const key = col && col.sort;
-  if (key) {
-    const dir = state.sort.dir;
-    rows.sort((a, b) => {
-      let va = sortVal(a, key), vb = sortVal(b, key);
-      if (key === 'n' || key === 'hybk') return String(va).localeCompare(String(vb), 'zh') * dir;
-      return (va - vb) * dir;
-    });
+  const kw = S.search.trim().toLowerCase();
+  if (kw) {
+    rows = rows.filter((s) => s.code.includes(kw) || (s.name || '').toLowerCase().includes(kw) ||
+      (blockTags(s.code, 3).join('') + (s.industry || '')).toLowerCase().includes(kw));
   }
   return rows;
 }
 
-function renderTable() {
-  renderHead();
-  const cols = COLS[state.tab];
-  const rows = getRows();
+function renderList() {
+  if (!S.day) return;
+  $('#cntZt').textContent = S.day.zt.length;
+  $('#cntZb').textContent = S.day.zb.length;
+  $('#cntDt').textContent = S.day.dt.length;
+  const cols = TABLE_COLS[S.tab];
+  const rows = currentRows();
+  const thead = $('#thead');
+  thead.innerHTML = `<tr>${cols.map((c) => `<th>${c.t}</th>`).join('')}</tr>`;
+  const tbody = $('#tbody');
   if (!rows.length) {
-    tbodyEl.innerHTML = '<tr><td colspan="' + cols.length + '" class="empty">无匹配数据</td></tr>';
-    tableFootEl.textContent = '';
+    tbody.innerHTML = `<tr><td colspan="${cols.length}"><div class="empty">暂无数据</div></td></tr>`;
+    $('#tableFoot').textContent = '';
     return;
   }
-  tbodyEl.innerHTML = rows.map((s, i) => {
-    const cells = cols.map((c) => {
-      if (c.k === 'idx') return '<td class="idx">' + (i + 1) + '</td>';
-      const cls = (c.num ? 'num ' : '') + (LEFT_KEYS.has(c.k) ? 'l' : '');
-      return '<td data-k="' + c.k + '" class="' + cls.trim() + '">' + cellHTML(c.k, s) + '</td>';
-    });
-    return '<tr data-code="' + s.c + '" data-m="' + s.m + '" data-name="' + esc(s.n) + '">' + cells.join('') + '</tr>';
+  tbody.innerHTML = rows.map((s, i) => {
+    const tds = cols.map((c) => {
+      const val = c.v(s, i);
+      if (c.cls === 'chg') {
+        const v = chgOf(s.code, s.chg);
+        const cls = v == null ? '' : v > 0 ? 'num-up' : v < 0 ? 'num-down' : '';
+        return `<td class="${cls}">${val}</td>`;
+      }
+      return `<td class="${c.cls || ''}">${val}</td>`;
+    }).join('');
+    return `<tr>${tds}</tr>`;
   }).join('');
-  tableFootEl.textContent = '共 ' + rows.length + ' 条';
+  $('#tableFoot').textContent = `共 ${rows.length} 条${rows.length !== (S.day[S.tab] || []).length ? '（已筛选）' : ''}`;
 }
 
-function renderIndustryOptions() {
-  const ind = countBy(state.data[state.tab].map((s) => s.hybk || '其他'));
-  const entries = Object.entries(ind).sort((a, b) => b[1] - a[1]);
-  const cur = indEl.value;
-  indEl.innerHTML = '<option value="">全部行业</option>' + entries.map(([h, n]) => '<option value="' + esc(h) + '">' + esc(h) + '（' + n + '）</option>').join('');
-  if (cur && entries.some((e) => e[0] === cur)) indEl.value = cur;
-  else indEl.value = '';
-  state.filters.industry = indEl.value;
-}
-
-/* ---------- data loading ---------- */
-async function init() {
-  clearTimeout(refreshTimer);
-  pendingScroll = null;
-  setLoading(true);
+/* ---------------------------- modal ---------------------------- */
+async function openStock(code, name) {
+  $('#modalTitle').innerHTML = `${esc(name || code)}<span class="sub">${code}</span>`;
+  $('#modal').classList.add('on');
   try {
-    const [zt, zb, dt, qs] = await Promise.all([
-      fetchPool('zt', '20991231'), fetchPool('zb', '20991231'), fetchPool('dt', '20991231'),
-      fetchStrongPool('20991231').catch(() => null)
-    ]);
-    const qd = zt.qdate || todayStr();
-    state.date = qd;
-    dateInput.value = toInput(qd);
-    state.qsError = qs == null;
-    state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs || [] };
-    state.tab = 'zt';
-    state.filters = { search: '', lbc: 'all', industry: '' };
-    searchEl.value = ''; lbcEl.value = 'all';
-    lbcEl.style.display = '';
-    document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === 'zt'));
-    setDefaultSort('zt');
-    renderAll();
-    latestDate = state.date;
-    isOnLatest = true;
-    state.lastUpdate = new Date();
-    scheduleRefresh();
-    updateStatus();
-  } catch (e) {
-    summaryEl.textContent = '加载失败：' + e.message + '，请检查网络后点击“刷新”重试。';
-    toast('加载失败：' + e.message);
-  } finally {
-    setLoading(false);
-  }
-}
-
-async function applyDay(date, opts) {
-  opts = opts || {};
-  const [zt, zb, dt, qs] = await Promise.all([
-    fetchPool('zt', date), fetchPool('zb', date), fetchPool('dt', date),
-    fetchStrongPool(date).catch(() => null)
-  ]);
-  const qd = zt.qdate || date;
-  const has = zt.list.length + zb.list.length + dt.list.length > 0;
-  let actual = date;
-  if (has && Number(date) > Number(qd)) {
-    actual = qd;
-    if (!opts.silent) toast(toInput(date) + ' 非交易日，已切换至最近交易日 ' + toInput(actual));
-  }
-  state.date = actual;
-  dateInput.value = toInput(actual);
-  if (qs == null && !opts.silent) toast('强势股池数据更新失败，已保留上次数据');
-  state.qsError = qs == null;
-  state.data = { zt: zt.list, zb: zb.list, dt: dt.list, qs: qs == null ? (state.data.qs || []) : qs };
-  renderAll({ skipPrev: !!opts.skipPrev });
-  return actual;
-}
-
-async function loadDate(date) {
-  pendingScroll = null;
-  setLoading(true);
-  try {
-    await applyDay(date, {});
-    isOnLatest = (state.date === latestDate);
-  } catch (e) {
-    toast('加载失败：' + e.message);
-    summaryEl.textContent = '加载失败：' + e.message + '，请点击“刷新”重试。';
-  } finally {
-    setLoading(false);
-  }
-}
-
-async function nav(dir) {
-  pendingScroll = null;
-  setLoading(true);
-  try {
-    const base = state.date || todayStr();
-    if (!latestDate) latestDate = state.date;
-    let d = parseYmd(base);
-    for (let i = 0; i < 30; i++) {
-      d = addDays(d, dir);
-      const ds = fmtYmd(d);
-      if (dir > 0 && Number(ds) > Number(latestDate)) {
-        const lp = await fetchPool('zt', '20991231');
-        latestDate = lp.qdate || latestDate;
-        if (Number(latestDate) > Number(base)) {
-          await loadDate(latestDate);
-        } else {
-          toast('已是最新交易日');
-        }
-        return;
-      }
-      const probe = await fetchPool('zt', ds);
-      if (probe.list.length > 0) {
-        await loadDate(ds);
-        return;
-      }
+    if (!S.minute.has(code)) {
+      const m = await fetchMinute(code);
+      if (m) S.minute.set(code, m);
     }
-    toast(dir < 0 ? '未找到更早的交易日数据' : '已是最新交易日');
+    drawIntra(code);
+    await drawKline(code);
   } catch (e) {
-    toast('导航失败：' + e.message);
-  } finally {
-    setLoading(false);
+    console.error(e);
   }
 }
 
-// 刷新当前视图：保持当前日期/页签/筛选/排序不变，仅重新拉取数据
-async function refresh() {
-  setLoading(true);
-  try {
-    saveScrolls();
-    if (state.followLatest && isOnLatest) {
-      const probe = await fetchPool('zt', '20991231');
-      const qd = probe.qdate || state.date;
-      if (Number(qd) > Number(state.date)) {
-        latestDate = qd;
-        await applyDay(qd, { silent: true });
-        isOnLatest = true;
-      } else {
-        await applyDay(state.date, { silent: true });
-      }
-    } else {
-      await applyDay(state.date, { silent: true });
-    }
-    state.lastUpdate = new Date();
-    updateStatus();
-    toast('已刷新');
-  } catch (e) {
-    toast('刷新失败：' + e.message);
-  } finally {
-    setLoading(false);
+function drawIntra(code) {
+  const m = S.minute.get(code);
+  const canvas = $('#chartIntra');
+  if (!m) {
+    const ctx = canvas.getContext('2d');
+    canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#9aa5b1'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('暂无分时数据', canvas.clientWidth / 2, canvas.clientHeight / 2);
+    return;
   }
+  const vals = new Array(242).fill(null);
+  for (const [slot, p] of m.pts) vals[slot] = (p - m.pre) / m.pre * 100;
+  drawLineChart(canvas, {
+    series: [{ name: '涨幅', color: vals[241] >= 0 ? '#ef4444' : '#16a34a', vals }],
+    xFrom: 0, xTo: 241,
+    xLabels: SLOT_LABELS,
+    yFmt: (v) => v.toFixed(1) + '%',
+    legend: false,
+    tipFmt: (items, idx) => `<div>${labelOfSlot(idx)}</div><div>${items[0] ? items[0].v.toFixed(2) + '%' : '—'}</div>`,
+  });
 }
 
-// “今天”：跳回最新交易日并刷新数据
-async function goToday() {
-  pendingScroll = null;
-  setLoading(true);
-  try {
-    const probe = await fetchPool('zt', '20991231');
-    const qd = probe.qdate || state.date;
-    latestDate = qd;
-    if (Number(qd) === Number(state.date)) {
-      saveScrolls();
-      await applyDay(qd, { silent: true });
-    } else {
-      await applyDay(qd, {});
-    }
-    isOnLatest = true;
-    state.lastUpdate = new Date();
-    updateStatus();
-  } catch (e) {
-    toast('加载失败：' + e.message);
-  } finally {
-    setLoading(false);
+async function drawKline(code) {
+  const sym = (isSh(code) ? 'sh' : 'sz') + code;
+  const j = await fetchJSON(API.TX_K + `${sym},day,,,60,qfq`, 12000);
+  const d = j && j.data && j.data[sym];
+  const k = d && (d.qfqday || d.day);
+  const canvas = $('#chartKline');
+  if (!k || !k.length) {
+    const ctx = canvas.getContext('2d');
+    canvas.width = canvas.clientWidth; canvas.height = canvas.clientHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#9aa5b1'; ctx.font = '13px sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText('暂无 K 线数据', canvas.clientWidth / 2, canvas.clientHeight / 2);
+    return;
   }
+  const rows = k.map((r) => ({ date: r[0], open: +r[1], close: +r[2], high: +r[3], low: +r[4] }));
+  const vals = rows.map((r) => r.close);
+  drawLineChart(canvas, {
+    series: [{ name: '收盘', color: '#2563eb', vals }],
+    xFrom: 0, xTo: rows.length - 1,
+    xLabels: [[0, rows[0].date.slice(5)], [Math.floor(rows.length / 2), rows[Math.floor(rows.length / 2)].date.slice(5)], [rows.length - 1, rows[rows.length - 1].date.slice(5)]],
+    yFmt: (v) => v.toFixed(2),
+    legend: false,
+  });
 }
 
-async function refreshPrevDelta() {
-  state.prevZt = null;
-  renderCards();
-  renderLadder();
-  try {
-    let d = parseYmd(state.date);
-    for (let i = 0; i < 30; i++) {
-      d = addDays(d, -1);
-      const probe = await fetchPool('zt', fmtYmd(d));
-      if (probe.list.length > 0) { state.prevZt = probe.list.length; break; }
-    }
-  } catch (e) { /* ignore */ }
-  renderCards();
-  renderLadder();
-}
-
-/* ---------- CSV export ---------- */
-function csvQuote(v) {
-  v = String(v);
-  return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v;
-}
-function exportCell(k, s) {
-  switch (k) {
-    case 'code': return s.c; case 'name': return s.n;
-    case 'price': return fmtPrice(s.p); case 'zdp': return fmtPct(s.zdp);
-    case 'lbc': return s.lbc; case 'days': return s.days;
-    case 'zttj': return fmtZttj(s.zttj);
-    case 'fbt': return fmtTime(s.fbt); case 'lbt': return fmtTime(s.lbt);
-    case 'zbc': return s.zbc; case 'fund': return s.fund;
-    case 'hs': return fmtPct(s.hs); case 'amount': return s.amount;
-    case 'zf': return fmtPct(s.zf); case 'hybk': return s.hybk;
-  }
-  return '';
-}
+/* ---------------------------- export ---------------------------- */
 function exportCSV() {
-  const cols = COLS[state.tab];
-  const rows = getRows();
-  if (!rows.length) { toast('没有可导出的数据'); return; }
-  const header = cols.map((c) => c.label).join(',');
-  const lines = rows.map((s, i) => cols.map((c) => csvQuote(c.k === 'idx' ? (i + 1) : exportCell(c.k, s))).join(','));
-  const csv = '\uFEFF' + header + '\n' + lines.join('\n');
-  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+  const cols = TABLE_COLS[S.tab];
+  const rows = currentRows();
+  const head = cols.map((c) => c.t).join(',');
+  const lines = rows.map((s, i) => cols.map((c) => {
+    let v = c.v(s, i);
+    v = String(v).replace(/<[^>]+>/g, '').replace(/,/g, ' ');
+    return v;
+  }).join(','));
+  const csv = '\ufeff' + [head, ...lines].join('\n');
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'A股涨停_' + state.tab + '_' + state.date + '.csv';
-  document.body.appendChild(a);
+  a.download = `${S.date}-${S.tab}.csv`;
   a.click();
-  a.remove();
   URL.revokeObjectURL(a.href);
 }
 
-/* ---------- events ---------- */
-function setTab(tab) {
-  state.tab = tab;
-  document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  lbcEl.style.display = tab === 'zt' ? '' : 'none';
-  if (tab !== 'zt') state.filters.lbc = 'all';
-  setDefaultSort(tab);
-  renderIndustryOptions();
-  renderTable();
+/* ---------------------------- events ---------------------------- */
+function bindEvents() {
+  $('#viewTabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-view]');
+    if (!btn) return;
+    S.view = btn.dataset.view;
+    $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
+    ['relay', 'sector', 'list'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
+    if (S.view === 'sector' && !S.boardCurves) renderSector();
+  });
+
+  $('#ruleTabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-rule]');
+    if (!btn) return;
+    S.rule = btn.dataset.rule;
+    $$('#ruleTabs button').forEach((b) => b.classList.toggle('on', b === btn));
+    renderLadder();
+  });
+
+  $('#chips').addEventListener('click', (e) => {
+    const btn = e.target.closest('.chip');
+    if (!btn) return;
+    S.chip = btn.dataset.chip || null;
+    renderChips();
+    renderLadder();
+  });
+
+  $('#ladder').addEventListener('click', (e) => {
+    const el = e.target.closest('.stk');
+    if (el) openStock(el.dataset.code, el.querySelector('.nm').textContent);
+  });
+
+  $('#sectorMode').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-m]');
+    if (!btn) return;
+    S.boardMode = btn.dataset.m;
+    $$('#sectorMode button').forEach((b) => b.classList.toggle('on', b === btn));
+    updateSectorHint();
+    drawSectorChart();
+  });
+
+  $('#sectorList').addEventListener('click', (e) => {
+    const row = e.target.closest('.srow');
+    if (!row) return;
+    const name = row.dataset.board;
+    if (S.boardSel.has(name)) S.boardSel.delete(name); else S.boardSel.add(name);
+    if (S.boardSel.size > 8) {
+      const first = Array.from(S.boardSel)[0];
+      S.boardSel.delete(first);
+      toast('最多同时对比 8 个板块');
+    }
+    renderSector();
+  });
+
+  $('#tabTabs').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-tab]');
+    if (!btn) return;
+    S.tab = btn.dataset.tab;
+    $$('#tabTabs button').forEach((b) => b.classList.toggle('on', b === btn));
+    renderList();
+  });
+
+  let searchTimer = null;
+  $('#search').addEventListener('input', (e) => {
+    clearTimeout(searchTimer);
+    const v = e.target.value;
+    searchTimer = setTimeout(() => { S.search = v; renderList(); }, 180);
+  });
+  $('#levelFilter').addEventListener('change', (e) => { S.level = e.target.value; renderList(); });
+  $('#exportBtn').addEventListener('click', exportCSV);
+  $('#tbody').addEventListener('click', (e) => {
+    const el = e.target.closest('.name');
+    if (el) openStock(el.dataset.code, el.textContent);
+  });
+
+  $('#prevDay').addEventListener('click', () => loadDay(shiftDay(S.date, -1)));
+  $('#nextDay').addEventListener('click', () => {
+    const n = shiftDay(S.date, 1);
+    if (n > ds(new Date())) { toast('已经是最新交易日'); return; }
+    loadDay(n);
+  });
+  $('#todayBtn').addEventListener('click', () => loadDay(ds(new Date())));
+  $('#refreshBtn').addEventListener('click', () => loadDay(S.date));
+  $('#dateInput').addEventListener('change', (e) => {
+    const v = e.target.value;
+    if (!v) return;
+    loadDay(v.replace(/-/g, ''));
+  });
+
+  $('#modalClose').addEventListener('click', () => $('#modal').classList.remove('on'));
+  $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').classList.remove('on'); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('#modal').classList.remove('on'); });
+
+  let resizeTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (S.view === 'sector' && S.boardCurves) drawSectorChart();
+    }, 180);
+  });
 }
 
-dateInput.addEventListener('change', () => {
-  const v = dateInput.value.replace(/-/g, '');
-  if (v && v.length === 8) loadDate(v);
-});
-$('prevDay').addEventListener('click', () => nav(-1));
-$('nextDay').addEventListener('click', () => nav(1));
-$('todayBtn').addEventListener('click', goToday);
-$('refreshBtn').addEventListener('click', refresh);
-tabsEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('.tab');
-  if (btn) setTab(btn.dataset.tab);
-});
-searchEl.addEventListener('input', () => { state.filters.search = searchEl.value; renderTable(); });
-lbcEl.addEventListener('change', () => { state.filters.lbc = lbcEl.value; renderTable(); });
-indEl.addEventListener('change', () => { state.filters.industry = indEl.value; renderTable(); });
-$('exportBtn').addEventListener('click', exportCSV);
-pauseBtn.addEventListener('click', () => {
-  state.auto = !state.auto;
-  pauseBtn.textContent = state.auto ? '暂停' : '继续';
-  if (state.auto) scheduleRefresh();
-  else clearTimeout(refreshTimer);
-  updateStatus();
-});
-followLatestEl.addEventListener('change', () => { state.followLatest = followLatestEl.checked; });
-ladderList.addEventListener('click', (e) => {
-  const chip = e.target.closest('.stock-chip');
-  if (!chip) return;
-  state.filters.search = chip.dataset.code;
-  searchEl.value = chip.dataset.code;
-  if (state.tab !== 'zt') setTab('zt');
-  else renderTable();
-  document.querySelector('.table-panel').scrollIntoView({ behavior: 'smooth', block: 'start' });
-});
-modalClose.addEventListener('click', closeChart);
-chartModal.addEventListener('click', (e) => { if (e.target === chartModal) closeChart(); });
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeChart(); });
-tbodyEl.addEventListener('click', (e) => {
-  const link = e.target.closest('.name-link');
-  if (!link) return;
-  const tr = e.target.closest('tr');
-  if (!tr) return;
-  const code = tr.dataset.code;
-  const list = state.data[state.tab] || [];
-  let stock = null;
-  for (let i = 0; i < list.length; i++) { if (String(list[i].c) === code) { stock = list[i]; break; } }
-  if (!stock) stock = { c: code, m: tr.dataset.m, n: tr.dataset.name || code };
-  openChart(stock);
-});
-boardTabs.addEventListener('click', (e) => {
-  const btn = e.target.closest('.board-tab');
-  if (!btn) return;
-  boardState.mode = btn.dataset.mode;
-  document.querySelectorAll('.board-tab').forEach((b) => b.classList.toggle('active', b === btn));
-  const isAll = boardState.mode === 'all';
-  boardType.style.display = isAll ? '' : 'none';
-  boardSearch.style.display = isAll ? '' : 'none';
-  boardState.currentKey = null;
-  renderBoards();
-});
-boardType.addEventListener('click', (e) => {
-  const btn = e.target.closest('.board-type-btn');
-  if (!btn) return;
-  boardState.type = btn.dataset.type;
-  document.querySelectorAll('.board-type-btn').forEach((b) => b.classList.toggle('active', b === btn));
-  boardState.currentKey = null;
-  renderBoards();
-});
-boardSearch.addEventListener('input', () => { renderBoardTable(boardState.list); });
-boardBody.addEventListener('click', (e) => {
-  if (e.target.closest('[data-retry-board]')) {
-    boardState.currentKey = null;
-    renderBoards();
-    return;
-  }
-  const th = e.target.closest('th.sortable');
-  if (!th) return;
-  const k = th.dataset.bk;
-  if (boardState.sort.key === k) boardState.sort.dir *= -1;
-  else boardState.sort = { key: k, dir: -1 };
-  renderBoardTable(boardState.list);
-});
-strongSearch.addEventListener('input', () => { strongState.search = strongSearch.value; renderStrongPool(); });
-strongBody.addEventListener('click', (e) => {
-  if (e.target.closest('[data-retry-strong]')) {
-    strongBody.innerHTML = '<div class="empty-note">加载中…</div>';
-    fetchStrongPool(state.date).then(function (list) {
-      state.data.qs = list;
-      state.qsError = false;
-      renderStrongPool();
-    }).catch(function () {
-      state.qsError = true;
-      renderStrongPool();
-    });
-    return;
-  }
-  const th = e.target.closest('th.sortable');
-  if (th) {
-    const k = th.dataset.k;
-    if (strongState.sort.key === k) strongState.sort.dir *= -1;
-    else strongState.sort = { key: k, dir: (k === 'n' || k === 'hybk') ? 1 : -1 };
-    renderStrongPool();
-    return;
-  }
-  const link = e.target.closest('.name-link');
-  if (!link) return;
-  const tr = e.target.closest('tr');
-  if (!tr) return;
-  const code = tr.dataset.code;
-  let stock = null;
-  for (let i = 0; i < state.data.qs.length; i++) { if (String(state.data.qs[i].c) === code) { stock = state.data.qs[i]; break; } }
-  if (!stock) stock = { c: code, m: tr.dataset.m, n: tr.dataset.name || code };
-  openChart(stock);
-});
-$('strongExportBtn').addEventListener('click', exportStrongCSV);
-theadEl.addEventListener('click', (e) => {
-  const th = e.target.closest('th.sortable');
-  if (!th) return;
-  const k = th.dataset.k;
-  if (state.sort.key === k) state.sort.dir *= -1;
-  else state.sort = { key: k, dir: 1 };
-  renderTable();
-});
+/* 交易时段自动刷新 */
+function isTradingTime() {
+  const now = new Date();
+  const d = now.getDay();
+  if (d === 0 || d === 6) return false;
+  const m = now.getHours() * 60 + now.getMinutes();
+  return (m >= 555 && m <= 690) || (m >= 780 && m <= 905);
+}
+function startAuto() {
+  clearInterval(S.autoTimer);
+  S.autoTimer = setInterval(() => {
+    if (document.hidden) return;
+    if (!isTradingTime()) return;
+    if (S.date !== S.latestDate) return;
+    loadDay(S.date);
+  }, 60000);
+}
 
-let resizeTimer;
-window.addEventListener('resize', () => {
-  clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(renderCharts, 150);
-});
-
-setInterval(updateStatus, 1000);
-
-init();
+/* ---------------------------- boot ---------------------------- */
+bindEvents();
+const today = ds(new Date());
+$('#dateInput').value = `${today.slice(0, 4)}-${today.slice(4, 6)}-${today.slice(6, 8)}`;
+$('#dateInput').max = `${today.slice(0, 4)}-${today.slice(4, 6)}-${today.slice(6, 8)}`;
+loadDay(today).then(startAuto);
