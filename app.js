@@ -637,6 +637,19 @@ async function buildBoardCurves() {
       values.push(n ? sum / n : null);
       ztSeries.push(zc);
     }
+    // 采样为 3 分钟一个点，中间槽位是空的；不补密的话折线会断成一个个孤点（画不出来）
+    let f0 = -1, f1 = -1;
+    for (let i = 0; i < values.length; i++) if (values[i] != null) { if (f0 < 0) f0 = i; f1 = i; }
+    if (f0 >= 0) {
+      for (let i = f0 + 1; i < f1; i++) {
+        if (values[i] != null) continue;
+        let j = i + 1;
+        while (j <= f1 && values[j] == null) j++;
+        const a = values[i - 1], b = values[j], span = j - (i - 1);
+        for (let k = i; k < j; k++) values[k] = a + ((b - a) * (k - (i - 1))) / span;
+        i = j;
+      }
+    }
     return { name: b.name, values, ztCount: b.zt, ztSeries };
   });
 }
@@ -735,8 +748,9 @@ function drawLineChart(canvas, cfg) {
 }
 
 function drawEmpty(canvas, msg) {
-  const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
+  if (rect.width < 10 || rect.height < 10) return;
+  const dpr = window.devicePixelRatio || 1;
   const W = Math.max(200, Math.round(rect.width)), H = Math.max(120, Math.round(rect.height));
   canvas.width = W * dpr; canvas.height = H * dpr;
   const ctx = canvas.getContext('2d');
@@ -751,8 +765,10 @@ function drawEmpty(canvas, msg) {
 function paintChart(canvas) {
   const cfg = canvas._cfg;
   if (!cfg) return;
-  const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
+  // 视图隐藏时尺寸为 0，此时绘制会把位图压成 240x140（切换视图后就再也画不回正常尺寸）
+  if (rect.width < 10 || rect.height < 10) return;
+  const dpr = window.devicePixelRatio || 1;
   const W = Math.max(240, Math.round(rect.width));
   const H = Math.max(140, Math.round(rect.height));
   canvas.width = Math.round(W * dpr);
@@ -821,7 +837,7 @@ function paintChart(canvas) {
     let pen = false;
     for (let i = 0; i < s.vals.length; i++) {
       const v = s.vals[i];
-      if (v == null || !isFinite(v)) { pen = false; continue; }
+      if (v == null || !isFinite(v)) continue;
       const x = X(cfg.xFrom + i), y = Y(v);
       if (!pen) { ctx.moveTo(x, y); pen = true; } else ctx.lineTo(x, y);
     }
@@ -862,9 +878,20 @@ function paintChart(canvas) {
   }
 }
 
+function ensureChartObserver(canvas) {
+  if (canvas._ro || typeof ResizeObserver === 'undefined') return;
+  canvas._ro = new ResizeObserver(() => {
+    const r = canvas.getBoundingClientRect();
+    if (!canvas._cfg || r.width < 10 || r.height < 10) return;
+    paintChart(canvas);
+  });
+  canvas._ro.observe(canvas);
+}
+
 function bindChartEvents(canvas) {
   if (canvas._bound) return;
   canvas._bound = true;
+  ensureChartObserver(canvas);
 
   canvas.addEventListener('mousemove', (ev) => {
     const cfg = canvas._cfg;
@@ -1700,7 +1727,10 @@ function bindEvents() {
     S.view = btn.dataset.view;
     $$('#viewTabs button').forEach((b) => b.classList.toggle('on', b === btn));
     ['relay', 'sector', 'list'].forEach((v) => $('#view' + v[0].toUpperCase() + v.slice(1)).classList.toggle('hidden', v !== S.view));
-    if (S.view === 'sector' && !S.boardCurves) renderSector();
+    if (S.view === 'sector') {
+      if (!S.boardCurves) renderSector();
+      else requestAnimationFrame(() => requestAnimationFrame(() => drawSectorChart()));
+    }
   });
 
   $('#ruleTabs').addEventListener('click', (e) => {
