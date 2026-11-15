@@ -1758,8 +1758,10 @@ function bindEvents() {
     const btn = e.target.closest('button[data-m]');
     if (!btn) return;
     S.boardMode = btn.dataset.m;
-    $$('#sectorMode button').forEach((b) => b.classList.toggle('on', b === btn));
+    $('#sectorMode button').forEach((b) => b.classList.toggle('on', b === btn));
     updateSectorHint();
+    const secTip = $('#sectorTip');
+    if (secTip) secTip.classList.remove('on');
     drawSectorChart();
   });
 
